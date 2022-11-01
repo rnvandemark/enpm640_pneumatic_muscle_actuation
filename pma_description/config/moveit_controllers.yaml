@@ -8,6 +8,8 @@ moveit_simple_controller_manager:
 
   pma_planar_2dof_arm_controller:
     type: FollowJointTrajectory
+    action_ns: follow_joint_trajectory
     joints:
       - pma_planar_2dof_shoulder
       - pma_planar_2dof_elbow
+    default: true
