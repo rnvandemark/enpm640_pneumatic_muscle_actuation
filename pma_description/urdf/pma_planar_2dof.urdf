@@ -1,0 +1,98 @@
+<?xml version="1.0"?>
+<robot name="pma_planar_2dof" xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <material name="grey">
+    <color rgba="0.4 0.4 0.4 0.333"/>
+  </material>
+  <material name="red">
+    <color rgba="1.0 0.0 0.0 0.333"/>
+  </material>
+  <material name="cyan">
+    <color rgba="0.0 1.0 1.0 0.333"/>
+  </material>
+
+  <link name="pma_planar_2dof_base">
+    <visual>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry>
+        <cylinder length="0.2" radius="0.2"/>
+      </geometry>
+      <material name="grey"/>
+    </visual>
+    <collision>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry>
+        <cylinder length="0.2" radius="0.2"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <joint name="pma_planar_2dof_shoulder" type="continuous">
+    <parent link="pma_planar_2dof_base"/>
+    <child link="pma_planar_2dof_upperarm"/>
+    <origin rpy="0 0 0" xyz="0 0 0"/>
+    <axis xyz="0 0 1"/>
+  </joint>
+
+  <link name="pma_planar_2dof_upperarm">
+    <visual>
+      <origin rpy="0 0 0" xyz="0.5 0 0"/>
+      <geometry>
+        <box size="1.0 0.2 0.2"/>
+      </geometry>
+      <material name="red"/>
+    </visual>
+    <collision>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry>
+        <box size="1.0 0.2 0.2"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <joint name="pma_planar_2dof_elbow" type="continuous">
+    <parent link="pma_planar_2dof_upperarm"/>
+    <child link="pma_planar_2dof_forearm"/>
+    <origin rpy="0 0 0" xyz="1.0 0 0"/>
+    <axis xyz="0 0 1"/>
+  </joint>
+
+  <link name="pma_planar_2dof_forearm">
+    <visual>
+      <origin rpy="0 0 0" xyz="0.5 0 0"/>
+      <geometry>
+        <box size="1.0 0.2 0.2"/>
+      </geometry>
+      <material name="cyan"/>
+    </visual>
+    <collision>
+      <origin rpy="0 0 0" xyz="0.5 0 0"/>
+      <geometry>
+        <box size="1.0 0.2 0.2"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <joint name="pma_planar_2dof_flangejoint" type="fixed">
+    <parent link="pma_planar_2dof_forearm"/>
+    <child link="pma_planar_2dof_flange"/>
+    <origin rpy="0 0 0" xyz="1.0 0 0"/>
+    <axis xyz="0 0 1"/>
+  </joint>
+
+  <link name="pma_planar_2dof_flange">
+    <visual>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry>
+        <cylinder length="0.1" radius="0.1"/>
+      </geometry>
+      <material name="grey"/>
+    </visual>
+    <collision>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+      <geometry>
+        <cylinder length="0.1" radius="0.1"/>
+      </geometry>
+    </collision>
+  </link>
+</robot>

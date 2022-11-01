@@ -1,0 +1,14 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="pma_planar_2dof">
+    <xacro:arg name="initial_positions_file" default="initial_positions.yaml" />
+
+    <!-- Import pma_planar_2dof urdf file -->
+    <xacro:include filename="$(find pma_description)/urdf/pma_planar_2dof.urdf" />
+
+    <!-- Import control_xacro -->
+    <xacro:include filename="pma_planar_2dof.ros2_control.xacro" />
+
+
+    <xacro:pma_planar_2dof_ros2_control name="FakeSystem" initial_positions_file="$(arg initial_positions_file)"/>
+
+</robot>

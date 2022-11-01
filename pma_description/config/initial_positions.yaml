@@ -1,0 +1,5 @@
+# Default initial positions for pma_planar_2dof's ros2_control fake system
+
+initial_positions:
+  pma_planar_2dof_elbow: 0
+  pma_planar_2dof_shoulder: 0

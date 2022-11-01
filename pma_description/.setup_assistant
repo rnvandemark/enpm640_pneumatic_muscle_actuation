@@ -1,0 +1,25 @@
+moveit_setup_assistant_config:
+  urdf:
+    package: pma_description
+    relative_path: urdf/pma_planar_2dof.urdf
+  srdf:
+    relative_path: config/pma_planar_2dof.srdf
+  package_settings:
+    author_name: R. Nick Vandemark
+    author_email: rnvandemark@gmail.com
+    generated_timestamp: 1667263534
+  control_xacro:
+    command:
+      - position
+    state:
+      - position
+      - velocity
+  modified_urdf:
+    xacros:
+      - control_xacro
+  control_xacro:
+    command:
+      - position
+    state:
+      - position
+      - velocity

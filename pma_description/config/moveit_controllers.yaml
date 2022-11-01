@@ -1,0 +1,13 @@
+# MoveIt uses this configuration for controller management
+
+moveit_controller_manager: moveit_simple_controller_manager/MoveItSimpleControllerManager
+
+moveit_simple_controller_manager:
+  controller_names:
+    - pma_planar_2dof_arm_controller
+
+  pma_planar_2dof_arm_controller:
+    type: FollowJointTrajectory
+    joints:
+      - pma_planar_2dof_shoulder
+      - pma_planar_2dof_elbow
