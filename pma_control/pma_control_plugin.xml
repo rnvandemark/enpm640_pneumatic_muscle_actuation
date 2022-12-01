@@ -1,0 +1,9 @@
+<library path="sliding_mode_2dof_pressure_trajectory_controller">
+    <class name="pma_control/SlidingMode2DofPressureTrajectoryController"
+           type="pma_control::SlidingMode2DofPressureTrajectoryController"
+           base_class_type="controller_interface::ControllerInterface">
+        <description>
+            The sliding-mode penumatic muscle actuator pressure trajectory controller executes pressure-space trajectories on a set of joints.
+        </description>
+    </class>
+</library>

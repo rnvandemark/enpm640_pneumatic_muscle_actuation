@@ -1,0 +1,41 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+    <name>pma_control</name>
+    <version>0.0.0</version>
+    <description>Pneumatic muscle actuation (PMA) controller algorithms.</description>
+    <maintainer email="rnvandemark@gmail.com">R. Nick Vandemark</maintainer>
+    <license>BSD</license>
+    <author email="rnvandemark@gmail.com">R. Nick Vandemark</author>
+
+    <buildtool_depend>ament_cmake</buildtool_depend>
+    <buildtool_depend>eigen3_cmake_module</buildtool_depend>
+
+    <build_depend>angles</build_depend>
+    <exec_depend>angles</exec_depend>
+    <build_depend>pluginlib</build_depend>
+    <exec_depend>pluginlib</exec_depend>
+    <build_depend>realtime_tools</build_depend>
+    <exec_depend>realtime_tools</exec_depend>
+
+    <depend>builtin_interfaces</depend>
+    <depend>control_msgs</depend>
+    <depend>control_toolbox</depend>
+    <depend>controller_interface</depend>
+    <depend>Eigen3</depend>
+    <depend>hardware_interface</depend>
+    <depend>joint_trajectory_controller</depend>
+    <depend>lifecycle_msgs</depend>
+    <depend>pma_hardware</depend>
+    <depend>pma_interfaces</depend>
+    <depend>pma_util</depend>
+    <depend>rclcpp</depend>
+    <depend>rclcpp_action</depend>
+    <depend>rclcpp_lifecycle</depend>
+    <depend>std_msgs</depend>
+    <depend>trajectory_msgs</depend>
+
+    <export>
+        <build_type>ament_cmake</build_type>
+    </export>
+</package>
