@@ -4,7 +4,7 @@ controller_manager:
     update_rate: 100  # Hz
 
     pma_planar_2dof_arm_controller:
-      type: joint_trajectory_controller/JointTrajectoryController
+      type: pma_control/SlidingMode2DofPressureTrajectoryController
 
 
     joint_state_broadcaster:
@@ -15,8 +15,3 @@ pma_planar_2dof_arm_controller:
     joints:
       - pma_planar_2dof_shoulder
       - pma_planar_2dof_elbow
-    command_interfaces:
-      - position
-    state_interfaces:
-      - position
-      - velocity
