@@ -5,22 +5,21 @@
 
         <ros2_control name="${name}" type="system">
             <hardware>
-                <!-- By default, set up controllers for simulation. This won't work on real hardware -->
-                <plugin>mock_components/GenericSystem</plugin>
+                <plugin>pma_hardware/PmaPlanar2DofInterfaceHardware</plugin>
             </hardware>
             <joint name="pma_planar_2dof_shoulder">
-                <command_interface name="position"/>
+                <command_interface name="pressure"/>
                 <state_interface name="position">
                   <param name="initial_value">${initial_positions['pma_planar_2dof_shoulder']}</param>
                 </state_interface>
-                <state_interface name="velocity"/>
+                <state_interface name="pressure"/>
             </joint>
             <joint name="pma_planar_2dof_elbow">
-                <command_interface name="position"/>
+                <command_interface name="pressure"/>
                 <state_interface name="position">
                   <param name="initial_value">${initial_positions['pma_planar_2dof_elbow']}</param>
                 </state_interface>
-                <state_interface name="velocity"/>
+                <state_interface name="pressure"/>
             </joint>
 
         </ros2_control>
