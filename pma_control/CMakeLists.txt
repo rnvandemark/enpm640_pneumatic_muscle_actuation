@@ -19,7 +19,10 @@ find_package(realtime_tools REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(trajectory_msgs REQUIRED)
 
-include_directories(include)
+include_directories(
+    include
+    ${pma_hardware_INCLUDE_DIRS}
+)
 
 add_library(pmap_trajectory_controller SHARED
     src/trajectory_control/pmap_trajectory_controller.cpp
