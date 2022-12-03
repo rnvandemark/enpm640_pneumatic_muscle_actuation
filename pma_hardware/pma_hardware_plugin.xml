@@ -1,0 +1,9 @@
+<library path="pma_robot_hardware">
+    <class name="pma_hardware/PmaRobotHardware"
+           type="pma_hardware::PmaRobotHardware"
+           base_class_type="hardware_interface::SystemInterface">
+        <description>
+            A hardware interface specific to a pneumatic muscle actuator (PMA) robot arm.
+        </description>
+    </class>
+</library>

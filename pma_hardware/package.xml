@@ -10,6 +10,14 @@
 
     <buildtool_depend>ament_cmake</buildtool_depend>
 
+    <build_depend>pluginlib</build_depend>
+    <exec_depend>pluginlib</exec_depend>
+
+    <depend>controller_interface</depend>
+    <depend>hardware_interface</depend>
+    <depend>pma_util</depend>
+    <depend>rclcpp</depend>
+
     <export>
         <build_type>ament_cmake</build_type>
     </export>
