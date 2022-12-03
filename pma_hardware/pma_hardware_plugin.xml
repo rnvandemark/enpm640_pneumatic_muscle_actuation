@@ -1,0 +1,9 @@
+<library path="pma_robot_interfaces">
+    <class name="pma_hardware/PmaPlanar2DofInterfaceHardware"
+           type="pma_hardware::PmaPlanar2DofInterfaceHardware"
+           base_class_type="hardware_interface::SystemInterface">
+        <description>
+            A hardware interface specific to a planar 2DOF pneumatic muscle actuator (PMA) robot arm.
+        </description>
+    </class>
+</library>
