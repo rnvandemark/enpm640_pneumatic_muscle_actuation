@@ -9,6 +9,7 @@
     <author email="rnvandemark@gmail.com">R. Nick Vandemark</author>
 
     <buildtool_depend>ament_cmake</buildtool_depend>
+    <buildtool_depend>eigen3_cmake_module</buildtool_depend>
 
     <build_depend>angles</build_depend>
     <exec_depend>angles</exec_depend>
@@ -21,6 +22,7 @@
     <depend>control_msgs</depend>
     <depend>control_toolbox</depend>
     <depend>controller_interface</depend>
+    <depend>Eigen3</depend>
     <depend>hardware_interface</depend>
     <depend>joint_trajectory_controller</depend>
     <depend>lifecycle_msgs</depend>

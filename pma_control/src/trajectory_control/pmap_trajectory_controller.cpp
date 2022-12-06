@@ -1,49 +1,198 @@
 #include "pma_control/trajectory_control/pmap_trajectory_controller.hpp"
 
-#include <stddef.h>
-#include <chrono>
-#include <functional>
-#include <memory>
-#include <ostream>
-#include <ratio>
-#include <string>
-#include <vector>
+#include <cmath>
+#include <Eigen/Core>
+#include <Eigen/LU>
 
 #include "angles/angles.h"
-#include "builtin_interfaces/msg/duration.hpp"
-#include "builtin_interfaces/msg/time.hpp"
 #include "controller_interface/helpers.hpp"
 #include "hardware_interface/types/hardware_interface_return_values.hpp"
-#include "hardware_interface/types/hardware_interface_type_values.hpp"
 #include "joint_trajectory_controller/trajectory.hpp"
 #include "lifecycle_msgs/msg/state.hpp"
-#include "rclcpp/logging.hpp"
-#include "rclcpp/parameter.hpp"
-#include "rclcpp/qos.hpp"
-#include "rclcpp/qos_event.hpp"
-#include "rclcpp/time.hpp"
-#include "rclcpp_action/create_server.hpp"
-#include "rclcpp_action/server_goal_handle.hpp"
-#include "rclcpp_lifecycle/lifecycle_node.hpp"
-#include "rclcpp_lifecycle/node_interfaces/lifecycle_node_interface.hpp"
-#include "rclcpp_lifecycle/state.hpp"
-#include "std_msgs/msg/header.hpp"
-
+#include "pma_hardware/description/pneumatic_muscle_control_configuration.hpp"
+#include "pma_hardware/description/pneumatic_muscle_segment_configuration.hpp"
+#include "pma_hardware/description/pneumatic_muscle_segment_telemetry.hpp"
+#include "pma_hardware/math_utils/compute_segment_torques.hpp"
 #include "pma_util/util.hpp"
+#include "rclcpp_action/create_server.hpp"
+
+#define PMA_PI (M_PI)
+#define PMA_HPI (PMA_PI/2.0)
+
+static const size_t REQUIRED_DOF = 2;
+
+using namespace std::chrono_literals;
 
 namespace im = joint_trajectory_controller::interpolation_methods;
 
+// A single 2-DOF pressure point consists of the robot shoulder pressure (the
+// first element in the pair) and the robot elbow pressure (the second one).
+using JointPressureTrajectory2DofPressure = std::pair<double, double>;
+
+namespace
+{
+    rclcpp::Duration duration_from_rate(const double rate)
+    {
+        return rclcpp::Duration::from_seconds((rate > 0.0) ? (1.0 / rate) : 0.0);
+    }
+
+    void resize_pma_trajectory_point(
+        pma_control::PneumaticMuscleActuatorTrajectoryPoint& point,
+        const size_t size
+    )
+    {
+        point.joint_space.positions.resize(size, 0.0);
+        point.joint_space.velocities.resize(size, 0.0);
+        point.joint_space.accelerations.resize(size, 0.0);
+        point.joint_space.effort.resize(size, 0.0);
+        point.pressures.resize(size, 0.0);
+    }
+
+    double sat(const double y)
+    {
+        if (std::abs(y) <= 1)
+        {
+            return y;
+        }
+        else if (y > 0.0)
+        {
+            return +1;
+        }
+        else
+        {
+            return -1;
+        }
+    }
+
+    pma_control::PressureList compute_desired_input_pressures_for(
+        const pma_hardware::PneumaticMuscleControlConfiguration& pm_control_configuration,
+        const std::vector<pma_hardware::PneumaticMuscleSegmentConfiguration>& pm_segment_configurations,
+        const std::vector<pma_hardware::PneumaticMuscleSegmentTelemetry>& pm_segment_telemetries,
+        const std::vector<double>& desired_joint_positions,
+        const std::vector<double>& desired_joint_velocities,
+        const std::vector<double>& actual_joint_positions,
+        const std::vector<double>& actual_joint_velocities
+    )
+    {
+        const pma_hardware::PneumaticMuscleSegmentConfiguration& shoulder_segment_configuration = pm_segment_configurations[0];
+        const pma_hardware::PneumaticMuscleSegmentConfiguration& elbow_segment_configuration = pm_segment_configurations[1];
+        const pma_hardware::PneumaticMuscleSegmentTelemetry& shoulder_segment_telemetry = pm_segment_telemetries[0];
+        const pma_hardware::PneumaticMuscleSegmentTelemetry& elbow_segment_telemetry = pm_segment_telemetries[1];
+        double shoulder_torque_nominal_pressure;
+        double shoulder_torque_factor_input_pressure;
+        double elbow_torque_nominal_pressure;
+        double elbow_torque_factor_input_pressure;
+
+        pma_hardware::compute_shoulder_segment_torque_components(
+            shoulder_segment_configuration,
+            shoulder_segment_telemetry,
+            shoulder_torque_nominal_pressure,
+            shoulder_torque_factor_input_pressure
+        );
+        pma_hardware::compute_elbow_segment_torque_components(
+            elbow_segment_configuration,
+            elbow_segment_telemetry,
+            elbow_torque_nominal_pressure,
+            elbow_torque_factor_input_pressure
+        );
+
+#define DECLARE_SEGMENT_VARS(config, num) \
+        const double m_##num = config.mass; \
+        const double l_##num = config.segment_length; \
+        const double l_com_##num = config.segment_com_length; \
+        const double I_##num = m_##num * l_com_##num * l_com_##num; \
+        const double th_star_##num = actual_joint_positions[num-1]; \
+        const double th_dot_star_##num = actual_joint_velocities[num-1]; \
+        const double th_##num = desired_joint_positions[num-1]; \
+        const double th_dot_##num = desired_joint_velocities[num-1]
+
+        // Declare variables for each segment
+        DECLARE_SEGMENT_VARS(shoulder_segment_configuration, 1);
+        DECLARE_SEGMENT_VARS(elbow_segment_configuration, 2);
+
+#undef DECLARE_SEGMENT_VARS
+
+        // Declare any others
+        const double a_g = pm_control_configuration.a_g;
+        const Eigen::Vector2d th {{th_1, th_2}};
+        const Eigen::Vector2d th_dot {{th_dot_1, th_dot_2}};
+        const double c_2 = std::cos(th_2);
+
+        // Calculate the inverse of the D matrix
+        const double d11 = (2 * I_1) + (2 * I_2) + (m_2 * ((l_1 * l_1) + (2 * l_1 * l_com_2 * c_2)));
+        const double d12 = I_2 + (m_2 * l_1 * l_com_2 * c_2);
+        const double d22 = 2 * I_2;
+        const Eigen::Matrix2d D_inv = Eigen::Matrix2d({
+            {d11, d12},
+            {d12, d22}
+        }).inverse();
+
+        // Calculate the inverse of the G matrix
+        const Eigen::Matrix2d G_inv = (D_inv * Eigen::Matrix2d({
+            {shoulder_torque_factor_input_pressure, 0.0},
+            {0.0,                                   elbow_torque_factor_input_pressure}
+        })).inverse();
+
+        // Calculate the a vector
+        const double h = -m_2 * l_1 * l_com_2 * std::sin(th_2);
+        const Eigen::Matrix2d C
+        {
+            {h * th_dot_2,  (h * th_dot_1) + (h * th_dot_2)},
+            {-h * th_dot_1, 0.0}
+        };
+        const double f_2 = m_2 * l_com_2 * a_g * std::cos(th_1 + th_2);
+        const double f_1 = (((m_1 * l_com_1) + (m_2 * l_1)) * a_g * std::cos(th_1)) + f_2;
+        const Eigen::Vector2d f {{f_1, f_2}};
+        const Eigen::Vector2d tau_0 {{shoulder_torque_nominal_pressure, elbow_torque_nominal_pressure}};
+        const Eigen::Vector2d a = D_inv * ((C * th_dot * -1) - f + tau_0);
+
+        // Calculate the sliding manifold sigma
+        const Eigen::Vector2d th_r
+        {{
+            th_dot_star_1 - (pm_control_configuration.mu_1 * (th_1 - th_star_1)),
+            th_dot_star_2 - (pm_control_configuration.mu_2 * (th_2 - th_star_2))
+        }};
+        const double sigma_1 = th_dot_1 - th_r(0);
+        const double sigma_2 = th_dot_2 - th_r(1);
+
+        // Calculate the relavant boundary layer thickness vector
+        const Eigen::Vector2d ks
+        {{
+            pm_control_configuration.k_1 * sat(sigma_1 / pm_control_configuration.Gamma_1),
+            pm_control_configuration.k_2 * sat(sigma_2 / pm_control_configuration.Gamma_2)
+        }};
+
+        // Calculate the ideal input pressures
+        const Eigen::Vector2d delta_p = G_inv * (th_r - a - ks);
+
+        // Finished, return the input pressures as a list
+        return {delta_p(0), delta_p(1)};
+    }
+}
+
 namespace pma_control
 {
-PmapTrajectoryController::PmapTrajectoryController() :
+SlidingMode2DofPressureTrajectoryController::SlidingMode2DofPressureTrajectoryController() :
     controller_interface::ControllerInterface(),
     joint_names_({}),
-    dof_(0)
+    dof_(0),
+    state_publish_rate_(20.0),
+    state_publisher_period_(duration_from_rate(state_publish_rate_)),
+    action_monitor_rate_(50.0),
+    action_monitor_period_(duration_from_rate(action_monitor_rate_)),
+    interpolation_method_(im::DEFAULT_INTERPOLATION),
+    acceleration_gravity_(9.81),
+    sliding_mode_control_k_1_(1.0),
+    sliding_mode_control_k_2_(1.0),
+    sliding_mode_control_Gamma_1_(1.0),
+    sliding_mode_control_Gamma_2_(1.0),
+    sliding_mode_control_mu_1_(1.0),
+    sliding_mode_control_mu_2_(1.0)
 {
 }
 
 controller_interface::InterfaceConfiguration
-PmapTrajectoryController::command_interface_configuration() const
+SlidingMode2DofPressureTrajectoryController::command_interface_configuration() const
 {
     controller_interface::InterfaceConfiguration conf;
     conf.type = controller_interface::interface_configuration_type::INDIVIDUAL;
@@ -57,7 +206,7 @@ PmapTrajectoryController::command_interface_configuration() const
         std::exit(EXIT_FAILURE);
     }
     conf.names.reserve(dof_ * command_interface_types_.size());
-    for (const auto& joint_name : command_joint_names_)
+    for (const auto& joint_name : joint_names_)
     {
         for (const auto& interface_type : command_interface_types_)
         {
@@ -68,7 +217,7 @@ PmapTrajectoryController::command_interface_configuration() const
 }
 
 controller_interface::InterfaceConfiguration
-PmapTrajectoryController::state_interface_configuration() const
+SlidingMode2DofPressureTrajectoryController::state_interface_configuration() const
 {
     controller_interface::InterfaceConfiguration conf;
     conf.type = controller_interface::interface_configuration_type::INDIVIDUAL;
@@ -83,43 +232,51 @@ PmapTrajectoryController::state_interface_configuration() const
     return conf;
 }
 
-controller_interface::CallbackReturn PmapTrajectoryController::on_init()
+controller_interface::CallbackReturn
+SlidingMode2DofPressureTrajectoryController::on_init()
 {
-    fprintf(stdout, "Entered on_init()");
+    fprintf(stdout, "Entered on_init()\n");
 
     controller_interface::CallbackReturn rc = CallbackReturn::SUCCESS;
 
-    try
-    {
-        // with the lifecycle node being initialized, we can declare parameters
-        joint_names_ = auto_declare<std::vector<std::string>>("joints", joint_names_);
-        command_joint_names_ = auto_declare<std::vector<std::string>>("command_joints", command_joint_names_);
-        allow_partial_joints_goal_ = auto_declare<bool>("allow_partial_joints_goal", allow_partial_joints_goal_);
-        open_loop_control_ = auto_declare<bool>("open_loop_control", open_loop_control_);
-        allow_integration_in_goal_trajectories_ = auto_declare<bool>("allow_integration_in_goal_trajectories", allow_integration_in_goal_trajectories_);
-        state_publish_rate_ = auto_declare<double>("state_publish_rate", 50.0);
-        action_monitor_rate_ = auto_declare<double>("action_monitor_rate", 20.0);
+#define AUTO_DEC1(var_name, param_name, param_type) var_name = auto_declare<param_type>(param_name, var_name)
+#define AUTO_DEC2(var_desc, param_type) AUTO_DEC1(var_desc##_, #var_desc, param_type)
 
-        const std::string interpolation_string = auto_declare<std::string>(
+    // Declare parameters while the lifecycle node is initializing
+    try {
+        // Base controller parameters
+        AUTO_DEC1(joint_names_, "joints", std::vector<std::string>);
+        AUTO_DEC2(state_publish_rate, double);
+        AUTO_DEC2(action_monitor_rate, double);
+        interpolation_method_ = im::from_string(auto_declare<std::string>(
             "interpolation_method",
-            im::InterpolationMethodMap.at(im::DEFAULT_INTERPOLATION)
-        );
-        interpolation_method_ = im::from_string(interpolation_string);
-    }
-    catch (const std::exception& e)
-    {
-        fprintf(stderr, "Exception thrown during init stage with message: %s \n", e.what());
+            im::InterpolationMethodMap.at(interpolation_method_)
+        ));
+
+        // Parameters specific to sliding-mode control
+        AUTO_DEC2(acceleration_gravity, double);
+        AUTO_DEC2(sliding_mode_control_k_1, double);
+        AUTO_DEC2(sliding_mode_control_k_2, double);
+        AUTO_DEC2(sliding_mode_control_Gamma_1, double);
+        AUTO_DEC2(sliding_mode_control_Gamma_2, double);
+        AUTO_DEC2(sliding_mode_control_mu_1, double);
+        AUTO_DEC2(sliding_mode_control_mu_2, double);
+    } catch (const std::exception& e) {
+        fprintf(stderr, "Exception thrown during init stage with message: %s\n", e.what());
         rc = CallbackReturn::ERROR;
         goto END;
     }
 
+#undef AUTO_DEC2
+#undef AUTO_DEC1
+
 END:
-    fprintf(stdout, "on_init() rc=%s \n", pma_util::callback_return_to_string(rc));
+    fprintf(stdout, "on_init() rc=%s\n", pma_util::callback_return_to_string(rc));
     return rc;
 }
 
-controller_interface::CallbackReturn PmapTrajectoryController::on_configure(
-    const rclcpp_lifecycle::State &)
+controller_interface::CallbackReturn
+SlidingMode2DofPressureTrajectoryController::on_configure(const rclcpp_lifecycle::State& /*previous_state*/)
 {
     RCLCPP_INFO(get_node()->get_logger(), "Entered on_configure()");
 
@@ -127,84 +284,80 @@ controller_interface::CallbackReturn PmapTrajectoryController::on_configure(
 
     const auto logger = get_node()->get_logger();
 
-    const std::string interpolation_string = get_node()->get_parameter("interpolation_method").as_string();
-
-    // update parameters
-    joint_names_ = get_node()->get_parameter("joints").as_string_array();
-    if ((dof_ > 0) && (joint_names_.size() != dof_))
+    // First, attempt to reset
+    if (!reset())
     {
-        RCLCPP_ERROR(
-            logger,
-            "The PmapTrajectoryController does not support restarting with a different number of DOF"
-        );
-        // TODO(andyz): update vector lengths if num. joints did change and re-initialize them so we
-        // can continue
+        RCLCPP_ERROR(logger, "Failed to reset in on_configure().");
         rc = CallbackReturn::FAILURE;
         goto END;
     }
 
-    dof_ = joint_names_.size();
+    //
+    // Update parameters on configuration
+    //
 
-    // TODO(destogl): why is this here? Add comment or move
-    if (!reset())
+    joint_names_ = get_node()->get_parameter("joints").as_string_array();
+
+    state_publish_rate_ = get_node()->get_parameter("state_publish_rate").get_value<double>();
+    RCLCPP_INFO(logger, "Controller state will be published at %.2f Hz.", state_publish_rate_);
+
+    action_monitor_rate_ = get_node()->get_parameter("action_monitor_rate").get_value<double>();
+    RCLCPP_INFO(logger, "Action status changes will be monitored at %.2f Hz.", action_monitor_rate_);
+
+    interpolation_method_ = im::from_string(get_node()->get_parameter("interpolation_method").as_string());
+    RCLCPP_INFO(
+        logger,
+        "Using '%s' interpolation method.",
+        im::InterpolationMethodMap.at(interpolation_method_).c_str()
+    );
+
+    if ((dof_ > 0) && (joint_names_.size() != dof_))
     {
+        RCLCPP_ERROR(
+            logger,
+            "The SlidingMode2DofPressureTrajectoryController does not support restarting with a different number of DOF."
+        );
         rc = CallbackReturn::FAILURE;
         goto END;
     }
 
     if (joint_names_.empty())
     {
-        // TODO(destogl): is this correct? Can we really move-on if no joint names are not provided?
-        RCLCPP_WARN(logger, "'joints' parameter is empty.");
+        RCLCPP_ERROR(logger, "The 'joints' parameter is empty.");
+        rc = CallbackReturn::FAILURE;
+        goto END;
     }
 
-    command_joint_names_ = get_node()->get_parameter("command_joints").as_string_array();
-
-    if (command_joint_names_.empty())
-    {
-        command_joint_names_ = joint_names_;
-        RCLCPP_INFO(
-            logger,
-            "No specific joint names are used for command interfaces. Using 'joints' parameter."
-        );
-    }
-    else if (command_joint_names_.size() != joint_names_.size())
+    dof_ = joint_names_.size();
+    if (REQUIRED_DOF != dof_)
     {
         RCLCPP_ERROR(
             logger,
-            "'command_joints' parameter has to have the same size as 'joints' parameter."
+            "The SlidingMode2DofPressureTrajectoryController only supports %zu-DOF robots, but received %zu joint names.",
+            REQUIRED_DOF,
+            dof_
         );
         rc = CallbackReturn::FAILURE;
         goto END;
     }
 
-    // Check if only allowed interface types are used and initialize storage to avoid memory
-    // allocation during activation
+    default_tolerances_ = joint_trajectory_controller::get_segment_tolerances(*get_node(), joint_names_);
+
+    joint_command_subscriber_ = get_node()->create_subscription<JointTrajectoryMsg>(
+        "~/joint_trajectory",
+        rclcpp::SystemDefaultsQoS(),
+        std::bind(&SlidingMode2DofPressureTrajectoryController::topic_callback, this, std::placeholders::_1)
+    );
+
+    //
+    // Configure command and state interfaces
+    //
+
+    // Initialize storage to avoid memory allocation during activation
     joint_command_interface_.resize(command_interface_types_.size());
     joint_state_interface_.resize(state_interface_types_.size());
 
-    if (use_closed_loop_pid_adapter_)
-    {
-        pids_.resize(dof_);
-        ff_velocity_scale_.resize(dof_);
-        tmp_command_.resize(dof_, 0.0);
-
-        // Init PID gains from ROS parameter server
-        for (size_t i = 0; i < pids_.size(); ++i)
-        {
-            const std::string prefix = "gains." + command_joint_names_[i];
-            const auto k_p = auto_declare<double>(prefix + ".p", 0.0);
-            const auto k_i = auto_declare<double>(prefix + ".i", 0.0);
-            const auto k_d = auto_declare<double>(prefix + ".d", 0.0);
-            const auto i_clamp = auto_declare<double>(prefix + ".i_clamp", 0.0);
-            ff_velocity_scale_[i] =
-                auto_declare<double>("ff_velocity_scale/" + command_joint_names_[i], 0.0);
-            // Initialize PID
-            pids_[i] = std::make_shared<control_toolbox::Pid>(k_p, k_i, k_d, i_clamp, -i_clamp);
-        }
-    }
-
-    // Print output so users can be sure the interface setup is correct
+    // Print interface configuration so users can be sure it's correct
     RCLCPP_INFO(
         logger,
         "Command interfaces are [%s] and state interfaces are [%s].",
@@ -212,42 +365,16 @@ controller_interface::CallbackReturn PmapTrajectoryController::on_configure(
         pma_util::get_delimited_list(state_interface_types_, ", ").c_str()
     );
 
-    default_tolerances_ = joint_trajectory_controller::get_segment_tolerances(*get_node(), command_joint_names_);
+    //
+    // Handle updates to the state publisher
+    //
 
-    // Read parameters customizing controller for special cases
-    open_loop_control_ = get_node()->get_parameter("open_loop_control").get_value<bool>();
-    allow_integration_in_goal_trajectories_ = get_node()->get_parameter("allow_integration_in_goal_trajectories").get_value<bool>();
-
-    interpolation_method_ = im::from_string(interpolation_string);
-    RCLCPP_INFO(
-        logger,
-        "Using '%s' interpolation method.",
-        im::InterpolationMethodMap.at(interpolation_method_).c_str()
-    );
-
-    joint_command_subscriber_ = get_node()->create_subscription<trajectory_msgs::msg::JointTrajectory>(
-        "~/joint_trajectory",
-        rclcpp::SystemDefaultsQoS(),
-        std::bind(&PmapTrajectoryController::topic_callback, this, std::placeholders::_1)
-    );
-
-    // State publisher
-    state_publish_rate_ = get_node()->get_parameter("state_publish_rate").get_value<double>();
-    RCLCPP_INFO(logger, "Controller state will be published at %.2f Hz.", state_publish_rate_);
-    if (state_publish_rate_ > 0.0)
-    {
-        state_publisher_period_ = rclcpp::Duration::from_seconds(1.0 / state_publish_rate_);
-    }
-    else
-    {
-        state_publisher_period_ = rclcpp::Duration::from_seconds(0.0);
-    }
+    state_publisher_period_ = duration_from_rate(state_publish_rate_);
 
     publisher_ = get_node()->create_publisher<ControllerStateMsg>("~/state", rclcpp::SystemDefaultsQoS());
     state_publisher_ = std::make_unique<StatePublisher>(publisher_);
-
     state_publisher_->lock();
-    state_publisher_->msg_.joint_names = command_joint_names_;
+    state_publisher_->msg_.joint_names = joint_names_;
     state_publisher_->msg_.desired.positions.resize(dof_);
     state_publisher_->msg_.desired.velocities.resize(dof_);
     state_publisher_->msg_.desired.accelerations.resize(dof_);
@@ -257,47 +384,38 @@ controller_interface::CallbackReturn PmapTrajectoryController::on_configure(
 
     last_state_publish_time_ = get_node()->now();
 
-    // action server configuration
-    allow_partial_joints_goal_ = get_node()->get_parameter("allow_partial_joints_goal").get_value<bool>();
-    if (allow_partial_joints_goal_)
-    {
-        RCLCPP_INFO(logger, "Goals with partial set of joints are allowed");
-    }
+    //
+    // Handle action server configuration
+    //
 
-    action_monitor_rate_ = get_node()->get_parameter("action_monitor_rate").get_value<double>();
-    RCLCPP_INFO(logger, "Action status changes will be monitored at %.2f Hz.", action_monitor_rate_);
-    action_monitor_period_ = rclcpp::Duration::from_seconds(1.0 / action_monitor_rate_);
+    action_monitor_period_ = duration_from_rate(action_monitor_rate_);
 
-    using namespace std::placeholders;
-    action_server_ = rclcpp_action::create_server<FollowJTrajAction>(
+    action_server_ = rclcpp_action::create_server<FollowJointTrajAction>(
         get_node()->get_node_base_interface(),
         get_node()->get_node_clock_interface(),
         get_node()->get_node_logging_interface(),
         get_node()->get_node_waitables_interface(),
         std::string(get_node()->get_name()) + "/follow_joint_trajectory",
-        std::bind(&PmapTrajectoryController::goal_received_callback, this, _1, _2),
-        std::bind(&PmapTrajectoryController::goal_cancelled_callback, this, _1),
-        std::bind(&PmapTrajectoryController::goal_accepted_callback, this, _1)
+        std::bind(&SlidingMode2DofPressureTrajectoryController::goal_received_callback, this, std::placeholders::_1, std::placeholders::_2),
+        std::bind(&SlidingMode2DofPressureTrajectoryController::goal_cancelled_callback, this, std::placeholders::_1),
+        std::bind(&SlidingMode2DofPressureTrajectoryController::goal_accepted_callback, this, std::placeholders::_1)
     );
 
-    resize_joint_trajectory_point(state_current_, dof_);
-    resize_joint_trajectory_point(state_desired_, dof_);
-    resize_joint_trajectory_point(state_error_, dof_);
-    resize_joint_trajectory_point(last_commanded_state_, dof_);
+    resize_pma_trajectory_point(state_current_, dof_);
+    resize_pma_trajectory_point(state_desired_, dof_);
+    resize_pma_trajectory_point(state_error_, dof_);
 
 END:
     RCLCPP_INFO(logger, "on_configure() rc=%s", pma_util::callback_return_to_string(rc));
     return rc;
 }
 
-controller_interface::CallbackReturn PmapTrajectoryController::on_activate(
-    const rclcpp_lifecycle::State &)
+controller_interface::CallbackReturn
+SlidingMode2DofPressureTrajectoryController::on_activate(const rclcpp_lifecycle::State& /*previous_state*/)
 {
     RCLCPP_INFO(get_node()->get_logger(), "Entered on_activate()");
 
     controller_interface::CallbackReturn rc = CallbackReturn::SUCCESS;
-
-    trajectory_msgs::msg::JointTrajectoryPoint state;
 
     // order all joints in the storage
     for (size_t index = 0; index < command_interface_types_.size(); index++)
@@ -305,7 +423,7 @@ controller_interface::CallbackReturn PmapTrajectoryController::on_activate(
         const std::string& interface_str = command_interface_types_[index];
         auto& interface_obj = joint_command_interface_[index];
         if (!controller_interface::get_ordered_interfaces(command_interfaces_,
-                                                          command_joint_names_,
+                                                          joint_names_,
                                                           interface_str,
                                                           interface_obj
         ))
@@ -343,8 +461,9 @@ controller_interface::CallbackReturn PmapTrajectoryController::on_activate(
         }
     }
 
-    // Store 'home' pose
-    traj_msg_home_ptr_ = std::make_shared<trajectory_msgs::msg::JointTrajectory>();
+    // Create a 'home' pose, which is a simple trajectory with the only point
+    // being the current position state read off of the hardware interface
+    traj_msg_home_ptr_ = std::make_shared<JointTrajectoryMsg>();
     traj_msg_home_ptr_->header.stamp.sec = 0;
     traj_msg_home_ptr_->header.stamp.nanosec = 0;
     traj_msg_home_ptr_->points.resize(1);
@@ -358,39 +477,29 @@ controller_interface::CallbackReturn PmapTrajectoryController::on_activate(
 
     traj_external_point_ptr_ = std::make_shared<joint_trajectory_controller::Trajectory>();
     traj_home_point_ptr_ = std::make_shared<joint_trajectory_controller::Trajectory>();
-    traj_msg_external_point_ptr_.writeFromNonRT(std::shared_ptr<trajectory_msgs::msg::JointTrajectory>());
+    traj_msg_external_point_ptr_.writeFromNonRT(JointTrajectoryMsgSharedPtr());
 
     subscriber_is_active_ = true;
     traj_point_active_ptr_ = &traj_external_point_ptr_;
     last_state_publish_time_ = get_node()->now();
 
-    // Initialize current state storage if hardware state has tracking offset
+    // Initialize the current and desired states from the hardware interfaces
     read_state_from_hardware(state_current_);
-    read_state_from_hardware(state_desired_);
-    read_state_from_hardware(last_commanded_state_);
-    // Handle restart of controller by reading from commands if
-    // those are not nan
-    resize_joint_trajectory_point(state, dof_);
-//    if (read_state_from_command_interfaces(state))
-//    {
-//        state_current_ = state;
-//        state_desired_ = state;
-//        last_commanded_state_ = state;
-//    }
+    state_desired_ = state_current_;
 
 END:
     RCLCPP_INFO(get_node()->get_logger(), "on_activate() rc=%s", pma_util::callback_return_to_string(rc));
     return rc;
 }
 
-controller_interface::CallbackReturn PmapTrajectoryController::on_deactivate(
-    const rclcpp_lifecycle::State &)
+controller_interface::CallbackReturn
+SlidingMode2DofPressureTrajectoryController::on_deactivate(const rclcpp_lifecycle::State& /*previous_state*/)
 {
     RCLCPP_INFO(get_node()->get_logger(), "Entered on_deactivate()");
 
     controller_interface::CallbackReturn rc = CallbackReturn::SUCCESS;
 
-    // Halt in pressure-space by commanding the current pressure
+    // TODO(nick): Command the nominal pressures
     for (size_t index = 0; index < dof_; ++index)
     {
         joint_command_interface_[0][index].get().set_value(joint_command_interface_[0][index].get().get_value());
@@ -414,8 +523,8 @@ END:
     return rc;
 }
 
-controller_interface::CallbackReturn PmapTrajectoryController::on_cleanup(
-    const rclcpp_lifecycle::State &)
+controller_interface::CallbackReturn
+SlidingMode2DofPressureTrajectoryController::on_cleanup(const rclcpp_lifecycle::State& /*previous_state*/)
 {
     RCLCPP_INFO(get_node()->get_logger(), "Entered on_cleanup()");
 
@@ -430,8 +539,8 @@ END:
     return rc;
 }
 
-controller_interface::CallbackReturn PmapTrajectoryController::on_error(
-    const rclcpp_lifecycle::State &)
+controller_interface::CallbackReturn
+SlidingMode2DofPressureTrajectoryController::on_error(const rclcpp_lifecycle::State& /*previous_state*/)
 {
     RCLCPP_INFO(get_node()->get_logger(), "Entered on_error()");
 
@@ -448,36 +557,26 @@ END:
     return rc;
 }
 
-controller_interface::CallbackReturn PmapTrajectoryController::on_shutdown(
-    const rclcpp_lifecycle::State &)
+controller_interface::CallbackReturn
+SlidingMode2DofPressureTrajectoryController::on_shutdown(const rclcpp_lifecycle::State& /*previous_state*/)
 {
     RCLCPP_INFO(get_node()->get_logger(), "Entered on_shutdown()");
 
     controller_interface::CallbackReturn rc = CallbackReturn::SUCCESS;
-
-    // TODO(karsten1987): what to do?
 
 END:
     RCLCPP_INFO(get_node()->get_logger(), "on_shutdown() rc=%s", pma_util::callback_return_to_string(rc));
     return rc;
 }
 
-controller_interface::return_type PmapTrajectoryController::update(
-    const rclcpp::Time& time, const rclcpp::Duration& period)
+controller_interface::return_type SlidingMode2DofPressureTrajectoryController::update(
+    const rclcpp::Time& time,
+    const rclcpp::Duration& period)
 {
     if (get_state().id() == lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE)
     {
         return controller_interface::return_type::OK;
     }
-
-    auto compute_error_for_joint = [&](JointTrajectoryPoint& error,
-                                       int index,
-                                       const JointTrajectoryPoint& current,
-                                       const JointTrajectoryPoint& desired)
-    {
-        // error defined as the difference between current and desired
-        error.positions[index] = angles::shortest_angular_distance(current.positions[index], desired.positions[index]);
-    };
 
     // Check if a new external message has been received from nonRT threads
     auto current_external_msg = traj_external_point_ptr_->get_trajectory_msg();
@@ -490,19 +589,8 @@ controller_interface::return_type PmapTrajectoryController::update(
         traj_external_point_ptr_->update(*new_external_msg);
     }
 
-    // TODO(anyone): can I here also use const on joint_interface since the reference_wrapper is not
-    // changed, but its value only?
-    auto assign_interface_from_point = [&](auto& joint_interface,
-                                           const std::vector<double>& trajectory_point_interface)
-    {
-        for (size_t index = 0; index < dof_; ++index)
-        {
-            joint_interface[index].get().set_value(trajectory_point_interface[index]);
-        }
-    };
-
     // current state update
-    state_current_.time_from_start.set__sec(0);
+    state_current_.joint_space.time_from_start.set__sec(0);
     read_state_from_hardware(state_current_);
 
     // currently carrying out a trajectory
@@ -513,14 +601,7 @@ controller_interface::return_type PmapTrajectoryController::update(
         if (!(*traj_point_active_ptr_)->is_sampled_already())
         {
             first_sample = true;
-            if (open_loop_control_)
-            {
-                (*traj_point_active_ptr_)->set_point_before_trajectory_msg(time, last_commanded_state_);
-            }
-            else
-            {
-                (*traj_point_active_ptr_)->set_point_before_trajectory_msg(time, state_current_);
-            }
+            (*traj_point_active_ptr_)->set_point_before_trajectory_msg(time, state_current_.joint_space);
         }
 
         // find segment for current timestamp
@@ -528,7 +609,7 @@ controller_interface::return_type PmapTrajectoryController::update(
         const bool valid_point = (*traj_point_active_ptr_)->sample(
             time,
             interpolation_method_,
-            state_desired_,
+            state_desired_.joint_space,
             start_segment_itr,
             end_segment_itr
         );
@@ -539,30 +620,41 @@ controller_interface::return_type PmapTrajectoryController::update(
             bool outside_goal_tolerance = false;
             bool within_goal_time = true;
             double time_difference = 0.0;
-            const bool before_last_point = end_segment_itr != (*traj_point_active_ptr_)->end();
+            const bool before_last_point = (end_segment_itr != (*traj_point_active_ptr_)->end());
 
             // Check state/goal tolerance
             for (size_t index = 0; index < dof_; ++index)
             {
-                compute_error_for_joint(state_error_, index, state_current_, state_desired_);
+                // Update the error, defined as 'desired - current'
+                {
+                    const auto& js_desi = state_desired_.joint_space;
+                    const auto& js_curr = state_current_.joint_space;
+
+                    state_error_.joint_space.positions[index] = angles::shortest_angular_distance(js_curr.positions[index], js_desi.positions[index]);
+                    state_error_.joint_space.velocities[index] = js_desi.velocities[index] - js_curr.velocities[index];
+                    state_error_.joint_space.accelerations[index] = js_desi.accelerations[index] - js_curr.accelerations[index];
+                    state_error_.joint_space.effort[index] = js_desi.effort[index] - js_curr.effort[index];
+                    state_error_.pressures[index] = state_desired_.pressures[index] - state_current_.pressures[index];
+                }
 
                 // Always check the state tolerance on the first sample in case the first sample
                 // is the last point
-                if (
-                    (before_last_point || first_sample) &&
-                    !check_state_tolerance_per_joint(
-                        state_error_, index, default_tolerances_.state_tolerance[index], false))
+                if ((before_last_point || first_sample) && !check_state_tolerance_per_joint(state_error_.joint_space,
+                                                                                            index,
+                                                                                            default_tolerances_.state_tolerance[index],
+                                                                                            false
+                ))
                 {
                     tolerance_violated_while_moving = true;
                 }
                 // past the final point, check that we end up inside goal tolerance
-                if (
-                    !before_last_point &&
-                    !check_state_tolerance_per_joint(
-                        state_error_, index, default_tolerances_.goal_state_tolerance[index], false))
+                if (!before_last_point && !check_state_tolerance_per_joint(state_error_.joint_space,
+                                                                           index,
+                                                                           default_tolerances_.goal_state_tolerance[index],
+                                                                           false
+                ))
                 {
                     outside_goal_tolerance = true;
-
                     if (default_tolerances_.goal_time_tolerance != 0.0)
                     {
                         // if we exceed goal_time_tolerance set it to aborted
@@ -582,47 +674,46 @@ controller_interface::return_type PmapTrajectoryController::update(
             // set values for next hardware write() if tolerance is met
             if (!tolerance_violated_while_moving && within_goal_time)
             {
-                if (use_closed_loop_pid_adapter_)
+                // Convert desired state in joint-space to desired state in
+                // pressure-space
+                const PressureList desired_pressures = compute_desired_input_pressures_for(
+                    *(pm_control_configuration.get()),
+                    pm_segment_configurations,
+                    pm_segment_telemetries,
+                    state_desired_.joint_space.positions,
+                    state_desired_.joint_space.velocities,
+                    state_current_.joint_space.positions,
+                    state_current_.joint_space.velocities
+                );
+
+                // Set values for next hardware write()
+                for (size_t index = 0; index < dof_; ++index)
                 {
-                    // Update PIDs
-                    for (auto i = 0ul; i < dof_; ++i)
-                    {
-                        tmp_command_[i] = (state_desired_.velocities[i] * ff_velocity_scale_[i]) +
-                                                            pids_[i]->computeCommand(
-                                                                state_desired_.positions[i] - state_current_.positions[i],
-                                                                state_desired_.velocities[i] - state_current_.velocities[i],
-                                                                (uint64_t)period.nanoseconds());
-                    }
+                    joint_command_interface_[0][index].get().set_value(desired_pressures[index]);
                 }
-
-                // set values for next hardware write()
-                assign_interface_from_point(joint_command_interface_[0], state_desired_.positions);
-
-                // store the previous command. Used in open-loop control mode
-                last_commanded_state_ = state_desired_;
             }
 
             const auto active_goal = *rt_active_goal_.readFromRT();
             if (active_goal)
             {
                 // send feedback
-                auto feedback = std::make_shared<FollowJTrajAction::Feedback>();
+                auto feedback = std::make_shared<FollowJointTrajAction::Feedback>();
                 feedback->header.stamp = time;
                 feedback->joint_names = joint_names_;
 
-                feedback->actual = state_current_;
-                feedback->desired = state_desired_;
-                feedback->error = state_error_;
+                feedback->actual = state_current_.joint_space;
+                feedback->desired = state_desired_.joint_space;
+                feedback->error = state_error_.joint_space;
                 active_goal->setFeedback(feedback);
 
                 // check abort
                 if (tolerance_violated_while_moving)
                 {
                     set_hold_position();
-                    auto result = std::make_shared<FollowJTrajAction::Result>();
+                    auto result = std::make_shared<FollowJointTrajAction::Result>();
 
                     RCLCPP_WARN(get_node()->get_logger(), "Aborted due to state tolerance violation");
-                    result->set__error_code(FollowJTrajAction::Result::PATH_TOLERANCE_VIOLATED);
+                    result->set__error_code(FollowJointTrajAction::Result::PATH_TOLERANCE_VIOLATED);
                     active_goal->setAborted(result);
                     // TODO(matthew-reynolds): Need a lock-free write here
                     // See https://github.com/ros-controls/ros2_controllers/issues/168
@@ -634,8 +725,8 @@ controller_interface::return_type PmapTrajectoryController::update(
                 {
                     if (!outside_goal_tolerance)
                     {
-                        auto res = std::make_shared<FollowJTrajAction::Result>();
-                        res->set__error_code(FollowJTrajAction::Result::SUCCESSFUL);
+                        auto res = std::make_shared<FollowJointTrajAction::Result>();
+                        res->set__error_code(FollowJointTrajAction::Result::SUCCESSFUL);
                         active_goal->setSucceeded(res);
                         // TODO(matthew-reynolds): Need a lock-free write here
                         // See https://github.com/ros-controls/ros2_controllers/issues/168
@@ -646,8 +737,8 @@ controller_interface::return_type PmapTrajectoryController::update(
                     else if (!within_goal_time)
                     {
                         set_hold_position();
-                        auto result = std::make_shared<FollowJTrajAction::Result>();
-                        result->set__error_code(FollowJTrajAction::Result::GOAL_TOLERANCE_VIOLATED);
+                        auto result = std::make_shared<FollowJointTrajAction::Result>();
+                        result->set__error_code(FollowJointTrajAction::Result::GOAL_TOLERANCE_VIOLATED);
                         active_goal->setAborted(result);
                         // TODO(matthew-reynolds): Need a lock-free write here
                         // See https://github.com/ros-controls/ros2_controllers/issues/168
@@ -668,123 +759,54 @@ controller_interface::return_type PmapTrajectoryController::update(
         }
     }
 
-    publish_state(state_desired_, state_current_, state_error_);
+    // If it's time to do so, publish the state
+    if ((state_publisher_period_.seconds() > 0.0)
+        && (get_node()->now() >= (last_state_publish_time_ + state_publisher_period_))
+        && state_publisher_
+        && state_publisher_->trylock()
+    )
+    {
+        state_publisher_->msg_.header.stamp = last_state_publish_time_;
+        state_publisher_->msg_.desired = state_current_.joint_space;
+        state_publisher_->msg_.actual = state_desired_.joint_space;
+        state_publisher_->msg_.error = state_error_.joint_space;
+        last_state_publish_time_ = get_node()->now();
+        state_publisher_->unlockAndPublish();
+    }
+
     return controller_interface::return_type::OK;
 }
 
-void PmapTrajectoryController::read_state_from_hardware(JointTrajectoryPoint& state)
+void SlidingMode2DofPressureTrajectoryController::read_state_from_hardware(PneumaticMuscleActuatorTrajectoryPoint& state)
 {
-    auto assign_point_from_interface =
-        [&](std::vector<double>& trajectory_point_interface, const auto& joint_interface)
-    {
-        for (size_t index = 0; index < dof_; ++index)
-        {
-            trajectory_point_interface[index] = joint_interface[index].get().get_value();
-        }
-    };
-
     // Assign values from the hardware
-    // Position states always exist
-    assign_point_from_interface(state.positions, joint_state_interface_[0]);
-    // velocity and acceleration states are optional
-    // Make empty so the property is ignored during interpolation
-    state.velocities.clear();
-    state.accelerations.clear();
+    for (size_t index = 0; index < dof_; ++index)
+    {
+        state.joint_space.positions[index]     = joint_state_interface_[1][index].get().get_value();
+        state.joint_space.velocities[index]    = joint_state_interface_[2][index].get().get_value();
+        state.joint_space.accelerations[index] = joint_state_interface_[3][index].get().get_value();
+        state.joint_space.effort[index]        = joint_state_interface_[4][index].get().get_value();
+        state.pressures[index]                 = joint_state_interface_[5][index].get().get_value();
+    }
 }
 
-bool PmapTrajectoryController::read_state_from_command_interfaces(JointTrajectoryPoint& state)
-{
-    bool has_values = true;
-
-    auto assign_point_from_interface =
-        [&](std::vector<double>& trajectory_point_interface, const auto& joint_interface)
-    {
-        for (size_t index = 0; index < dof_; ++index)
-        {
-            trajectory_point_interface[index] = joint_interface[index].get().get_value();
-        }
-    };
-
-    auto interface_has_values = [](const auto& joint_interface)
-    {
-        return std::find_if(
-                         joint_interface.begin(), joint_interface.end(),
-                         [](const auto& interface)
-                         { return std::isnan(interface.get().get_value()); }) == joint_interface.end();
-    };
-
-    // Assign values from the command interfaces as state. Therefore needs check for both.
-    // Position state interface has to exist always
-    if (interface_has_values(joint_command_interface_[0]))
-    {
-        assign_point_from_interface(state.positions, joint_command_interface_[0]);
-    }
-    else
-    {
-        state.positions.clear();
-        has_values = false;
-    }
-    state.velocities.clear();
-    state.accelerations.clear();
-
-    return has_values;
-}
-
-bool PmapTrajectoryController::reset()
+bool SlidingMode2DofPressureTrajectoryController::reset()
 {
     subscriber_is_active_ = false;
     joint_command_subscriber_.reset();
 
-    for (const auto& pid : pids_)
-    {
-        pid->reset();
-    }
-
-    // iterator has no default value
-    // prev_traj_point_ptr_;
     traj_point_active_ptr_ = nullptr;
     traj_external_point_ptr_.reset();
     traj_home_point_ptr_.reset();
     traj_msg_home_ptr_.reset();
 
-    // reset pids
-    for (const auto& pid : pids_)
-    {
-        pid->reset();
-    }
+    // iterator has no default value
+    // prev_traj_point_ptr_;
 
     return true;
 }
 
-void PmapTrajectoryController::publish_state(
-    const JointTrajectoryPoint& desired_state, const JointTrajectoryPoint& current_state,
-    const JointTrajectoryPoint& state_error)
-{
-    if (state_publisher_period_.seconds() <= 0.0)
-    {
-        return;
-    }
-
-    if (get_node()->now() < (last_state_publish_time_ + state_publisher_period_))
-    {
-        return;
-    }
-
-    if (state_publisher_ && state_publisher_->trylock())
-    {
-        last_state_publish_time_ = get_node()->now();
-        state_publisher_->msg_.header.stamp = last_state_publish_time_;
-        state_publisher_->msg_.desired.positions = desired_state.positions;
-        state_publisher_->msg_.desired.velocities = desired_state.velocities;
-        state_publisher_->msg_.desired.accelerations = desired_state.accelerations;
-        state_publisher_->msg_.actual.positions = current_state.positions;
-        state_publisher_->msg_.error.positions = state_error.positions;
-        state_publisher_->unlockAndPublish();
-    }
-}
-
-void PmapTrajectoryController::topic_callback(
-    const std::shared_ptr<trajectory_msgs::msg::JointTrajectory> msg)
+void SlidingMode2DofPressureTrajectoryController::topic_callback(const JointTrajectoryMsgSharedPtr msg)
 {
     if (!validate_trajectory_msg(*msg))
     {
@@ -798,8 +820,9 @@ void PmapTrajectoryController::topic_callback(
     }
 };
 
-rclcpp_action::GoalResponse PmapTrajectoryController::goal_received_callback(
-    const rclcpp_action::GoalUUID &, std::shared_ptr<const FollowJTrajAction::Goal> goal)
+rclcpp_action::GoalResponse SlidingMode2DofPressureTrajectoryController::goal_received_callback(
+    const rclcpp_action::GoalUUID&,
+    std::shared_ptr<const FollowJointTrajAction::Goal> goal)
 {
     RCLCPP_INFO(get_node()->get_logger(), "Received new action goal");
 
@@ -807,7 +830,9 @@ rclcpp_action::GoalResponse PmapTrajectoryController::goal_received_callback(
     if (get_state().id() == lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE)
     {
         RCLCPP_ERROR(
-            get_node()->get_logger(), "Can't accept new action goals. Controller is not running.");
+            get_node()->get_logger(),
+            "Can't accept new action goals. Controller is not running."
+        );
         return rclcpp_action::GoalResponse::REJECT;
     }
 
@@ -820,8 +845,7 @@ rclcpp_action::GoalResponse PmapTrajectoryController::goal_received_callback(
     return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
 }
 
-rclcpp_action::CancelResponse PmapTrajectoryController::goal_cancelled_callback(
-    const std::shared_ptr<rclcpp_action::ServerGoalHandle<FollowJTrajAction>> goal_handle)
+rclcpp_action::CancelResponse SlidingMode2DofPressureTrajectoryController::goal_cancelled_callback(const FollowJointTrajActionGoalSharedPtr goal_handle)
 {
     RCLCPP_INFO(get_node()->get_logger(), "Got request to cancel goal");
 
@@ -834,23 +858,24 @@ rclcpp_action::CancelResponse PmapTrajectoryController::goal_cancelled_callback(
         set_hold_position();
 
         RCLCPP_DEBUG(
-            get_node()->get_logger(), "Canceling active action goal because cancel callback received.");
+            get_node()->get_logger(),
+            "Canceling active action goal because cancel callback received."
+        );
 
         // Mark the current goal as canceled
-        auto action_res = std::make_shared<FollowJTrajAction::Result>();
+        auto action_res = std::make_shared<FollowJointTrajAction::Result>();
         active_goal->setCanceled(action_res);
         rt_active_goal_.writeFromNonRT(RealtimeGoalHandlePtr());
     }
     return rclcpp_action::CancelResponse::ACCEPT;
 }
 
-void PmapTrajectoryController::goal_accepted_callback(
-    std::shared_ptr<rclcpp_action::ServerGoalHandle<FollowJTrajAction>> goal_handle)
+void SlidingMode2DofPressureTrajectoryController::goal_accepted_callback(FollowJointTrajActionGoalSharedPtr goal_handle)
 {
     // Update new trajectory
     {
         preempt_active_goal();
-        auto traj_msg = std::make_shared<trajectory_msgs::msg::JointTrajectory>(goal_handle->get_goal()->trajectory);
+        auto traj_msg = std::make_shared<JointTrajectoryMsg>(goal_handle->get_goal()->trajectory);
 
         add_new_trajectory_msg(traj_msg);
     }
@@ -868,8 +893,8 @@ void PmapTrajectoryController::goal_accepted_callback(
     );
 }
 
-void PmapTrajectoryController::fill_partial_goal(
-    std::shared_ptr<trajectory_msgs::msg::JointTrajectory> trajectory_msg) const
+void SlidingMode2DofPressureTrajectoryController::fill_partial_goal(
+    JointTrajectoryMsgSharedPtr trajectory_msg) const
 {
     // joint names in the goal are a subset of existing joints, as checked in goal_callback
     // so if the size matches, the goal contains all controller joints
@@ -882,58 +907,47 @@ void PmapTrajectoryController::fill_partial_goal(
 
     for (size_t index = 0; index < dof_; ++index)
     {
+        if (pma_util::list_contains(trajectory_msg->joint_names, joint_names_[index]))
         {
-            if (
-                std::find(
-                    trajectory_msg->joint_names.begin(), trajectory_msg->joint_names.end(),
-                    joint_names_[index]) != trajectory_msg->joint_names.end())
-            {
-                // joint found on msg
-                continue;
-            }
-            trajectory_msg->joint_names.push_back(joint_names_[index]);
+            // joint found on msg
+            continue;
+        }
 
-            for (auto& it : trajectory_msg->points)
+        trajectory_msg->joint_names.push_back(joint_names_[index]);
+
+        for (auto& it : trajectory_msg->points)
+        {
+            // Assume hold position with 0 velocity and acceleration for missing joints
+            if (!it.positions.empty())
             {
-                // Assume hold position with 0 velocity and acceleration for missing joints
-                if (!it.positions.empty())
-                {
-                    if (!std::isnan(joint_command_interface_[0][index].get().get_value()))
-                    {
-                        // copy last command if cmd interface exists
-                        it.positions.push_back(joint_command_interface_[0][index].get().get_value());
-                    }
-                    else
-                    {
-                        // copy current state if state interface exists
-                        it.positions.push_back(joint_state_interface_[0][index].get().get_value());
-                    }
-                }
-                if (!it.velocities.empty())
-                {
-                    it.velocities.push_back(0.0);
-                }
-                if (!it.accelerations.empty())
-                {
-                    it.accelerations.push_back(0.0);
-                }
-                if (!it.effort.empty())
-                {
-                    it.effort.push_back(0.0);
-                }
+                // copy current state if state interface exists
+                it.positions.push_back(joint_state_interface_[0][index].get().get_value());
+            }
+            if (!it.velocities.empty())
+            {
+                it.velocities.push_back(0.0);
+            }
+            if (!it.accelerations.empty())
+            {
+                it.accelerations.push_back(0.0);
+            }
+            if (!it.effort.empty())
+            {
+                it.effort.push_back(0.0);
             }
         }
     }
 }
 
-void PmapTrajectoryController::sort_to_local_joint_order(
-    std::shared_ptr<trajectory_msgs::msg::JointTrajectory> trajectory_msg)
+void SlidingMode2DofPressureTrajectoryController::sort_to_local_joint_order(
+    JointTrajectoryMsgSharedPtr trajectory_msg)
 {
     // rearrange all points in the trajectory message based on mapping
     std::vector<size_t> mapping_vector = joint_trajectory_controller::mapping(trajectory_msg->joint_names, joint_names_);
     auto remap = [this](
-                                 const std::vector<double>& to_remap,
-                                 const std::vector<size_t>& mapping) -> std::vector<double>
+        const std::vector<double>& to_remap,
+        const std::vector<size_t>& mapping
+    ) -> std::vector<double>
     {
         if (to_remap.empty())
         {
@@ -949,31 +963,27 @@ void PmapTrajectoryController::sort_to_local_joint_order(
         output.resize(mapping.size(), 0.0);
         for (size_t index = 0; index < mapping.size(); ++index)
         {
-            auto map_index = mapping[index];
-            output[map_index] = to_remap[index];
+            output[mapping[index]] = to_remap[index];
         }
         return output;
     };
 
     for (size_t index = 0; index < trajectory_msg->points.size(); ++index)
     {
-        trajectory_msg->points[index].positions =
-            remap(trajectory_msg->points[index].positions, mapping_vector);
-
-        trajectory_msg->points[index].velocities =
-            remap(trajectory_msg->points[index].velocities, mapping_vector);
-
-        trajectory_msg->points[index].accelerations =
-            remap(trajectory_msg->points[index].accelerations, mapping_vector);
-
-        trajectory_msg->points[index].effort =
-            remap(trajectory_msg->points[index].effort, mapping_vector);
+        trajectory_msg->points[index].positions = remap(trajectory_msg->points[index].positions, mapping_vector);
+        trajectory_msg->points[index].velocities = remap(trajectory_msg->points[index].velocities, mapping_vector);
+        trajectory_msg->points[index].accelerations = remap(trajectory_msg->points[index].accelerations, mapping_vector);
+        trajectory_msg->points[index].effort = remap(trajectory_msg->points[index].effort, mapping_vector);
     }
 }
 
-bool PmapTrajectoryController::validate_trajectory_point_field(
-    size_t joint_names_size, const std::vector<double>& vector_field,
-    const std::string& string_for_vector_field, size_t i, bool allow_empty) const
+bool SlidingMode2DofPressureTrajectoryController::validate_trajectory_point_field(
+    size_t joint_names_size,
+    const std::vector<double>& vector_field,
+    const std::string& string_for_vector_field,
+    size_t i,
+    bool allow_empty
+) const
 {
     if (allow_empty && vector_field.empty())
     {
@@ -982,26 +992,28 @@ bool PmapTrajectoryController::validate_trajectory_point_field(
     if (joint_names_size != vector_field.size())
     {
         RCLCPP_ERROR(
-            get_node()->get_logger(), "Mismatch between joint_names (%zu) and %s (%zu) at point #%zu.",
-            joint_names_size, string_for_vector_field.c_str(), vector_field.size(), i);
+            get_node()->get_logger(),
+            "Mismatch between joint_names (%zu) and %s (%zu) at point #%zu.",
+            joint_names_size,
+            string_for_vector_field.c_str(),
+            vector_field.size(),
+            i
+        );
         return false;
     }
     return true;
 }
 
-bool PmapTrajectoryController::validate_trajectory_msg(
-    const trajectory_msgs::msg::JointTrajectory& trajectory) const
+bool SlidingMode2DofPressureTrajectoryController::validate_trajectory_msg(const JointTrajectoryMsg& trajectory) const
 {
-    // If partial joints goals are not allowed, goal should specify all controller joints
-    if (!allow_partial_joints_goal_)
+    // Goal should specify all controller joints
+    if (trajectory.joint_names.size() != dof_)
     {
-        if (trajectory.joint_names.size() != dof_)
-        {
-            RCLCPP_ERROR(
-                get_node()->get_logger(),
-                "Joints on incoming trajectory don't match the controller joints.");
-            return false;
-        }
+        RCLCPP_ERROR(
+            get_node()->get_logger(),
+            "Joints on incoming trajectory don't match the controller joints."
+        );
+        return false;
     }
 
     if (trajectory.joint_names.empty())
@@ -1059,78 +1071,53 @@ bool PmapTrajectoryController::validate_trajectory_msg(
         }
         previous_traj_time = trajectory.points[i].time_from_start;
 
-        const size_t joint_count = trajectory.joint_names.size();
-        const auto& points = trajectory.points;
-        // This currently supports only position, velocity and acceleration inputs
-        if (allow_integration_in_goal_trajectories_)
-        {
-            const bool all_empty = points[i].positions.empty() && points[i].velocities.empty() &&
-                                                         points[i].accelerations.empty();
-            const bool position_error =
-                !points[i].positions.empty() &&
-                !validate_trajectory_point_field(joint_count, points[i].positions, "positions", i, false);
-            const bool velocity_error =
-                !points[i].velocities.empty() &&
-                !validate_trajectory_point_field(joint_count, points[i].velocities, "velocities", i, false);
-            const bool acceleration_error =
-                !points[i].accelerations.empty() &&
-                !validate_trajectory_point_field(
-                    joint_count, points[i].accelerations, "accelerations", i, false);
-            if (all_empty || position_error || velocity_error || acceleration_error)
-            {
-                return false;
-            }
-        }
-        else if (
-            !validate_trajectory_point_field(joint_count, points[i].positions, "positions", i, false) ||
-            !validate_trajectory_point_field(joint_count, points[i].velocities, "velocities", i, true) ||
-            !validate_trajectory_point_field(
-                joint_count, points[i].accelerations, "accelerations", i, true) ||
-            !validate_trajectory_point_field(joint_count, points[i].effort, "effort", i, true))
+#define VALIDATE_TRAJ_POINT_FIELD(f, b) (validate_trajectory_point_field(trajectory.joint_names.size(), trajectory.points[i].f, #f, i, b))
+
+        if (!VALIDATE_TRAJ_POINT_FIELD(positions, false)
+            || !VALIDATE_TRAJ_POINT_FIELD(velocities, true)
+            || !VALIDATE_TRAJ_POINT_FIELD(accelerations, true)
+            || !VALIDATE_TRAJ_POINT_FIELD(effort, true)
+        )
         {
             return false;
         }
+
+#undef VALIDATE_TRAJ_POINT_FIELD
+
     }
     return true;
 }
 
-void PmapTrajectoryController::add_new_trajectory_msg(
-    const std::shared_ptr<trajectory_msgs::msg::JointTrajectory>& traj_msg)
+void SlidingMode2DofPressureTrajectoryController::add_new_trajectory_msg(
+    const JointTrajectoryMsgSharedPtr& traj_msg)
 {
     traj_msg_external_point_ptr_.writeFromNonRT(traj_msg);
 }
 
-void PmapTrajectoryController::preempt_active_goal()
+void SlidingMode2DofPressureTrajectoryController::preempt_active_goal()
 {
     const auto active_goal = *rt_active_goal_.readFromNonRT();
     if (active_goal)
     {
         set_hold_position();
-        auto action_res = std::make_shared<FollowJTrajAction::Result>();
-        action_res->set__error_code(FollowJTrajAction::Result::INVALID_GOAL);
+        auto action_res = std::make_shared<FollowJointTrajAction::Result>();
+        action_res->set__error_code(FollowJointTrajAction::Result::INVALID_GOAL);
         action_res->set__error_string("Current goal cancelled due to new incoming action.");
         active_goal->setCanceled(action_res);
         rt_active_goal_.writeFromNonRT(RealtimeGoalHandlePtr());
     }
 }
 
-void PmapTrajectoryController::set_hold_position()
+void SlidingMode2DofPressureTrajectoryController::set_hold_position()
 {
-    trajectory_msgs::msg::JointTrajectory empty_msg;
+    JointTrajectoryMsg empty_msg;
     empty_msg.header.stamp = rclcpp::Time(0);
 
-    auto traj_msg = std::make_shared<trajectory_msgs::msg::JointTrajectory>(empty_msg);
+    auto traj_msg = std::make_shared<JointTrajectoryMsg>(empty_msg);
     add_new_trajectory_msg(traj_msg);
 }
-
-void PmapTrajectoryController::resize_joint_trajectory_point(
-    trajectory_msgs::msg::JointTrajectoryPoint& point, size_t size)
-{
-    point.positions.resize(size, 0.0);
 }
-
-}   // namespace pma_control
 
 #include "pluginlib/class_list_macros.hpp"
 
-PLUGINLIB_EXPORT_CLASS(pma_control::PmapTrajectoryController, controller_interface::ControllerInterface)
+PLUGINLIB_EXPORT_CLASS(pma_control::SlidingMode2DofPressureTrajectoryController, controller_interface::ControllerInterface)
