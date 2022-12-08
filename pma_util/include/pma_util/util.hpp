@@ -5,6 +5,7 @@
 #include <vector>
 #include <string>
 #include <algorithm>
+#include <numeric>
 
 namespace pma_util
 {

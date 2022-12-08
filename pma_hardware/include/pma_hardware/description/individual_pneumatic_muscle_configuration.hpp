@@ -1,5 +1,7 @@
 #pragma once
 
+#include <string>
+
 namespace pma_hardware
 {
 /**
@@ -84,6 +86,26 @@ public:
         dynamics_B_0_deflating(dB0d),
         dynamics_B_1_deflating(dB1d)
     {
+    }
+
+    /**
+     * Convert this data to a string.
+     * @return The stringified configuration.
+     */
+    std::string to_string() const
+    {
+        return std::string("{")
+            + "nominal_pressure=" + std::to_string(nominal_pressure)
+            + ", dynamics_F_0=" + std::to_string(dynamics_F_0)
+            + ", dynamics_F_1=" + std::to_string(dynamics_F_1)
+            + ", dynamics_K_0=" + std::to_string(dynamics_K_0)
+            + ", dynamics_K_1=" + std::to_string(dynamics_K_1)
+            + ", dynamics_B_0_inflating=" + std::to_string(dynamics_B_0_inflating)
+            + ", dynamics_B_1_inflating=" + std::to_string(dynamics_B_1_inflating)
+            + ", dynamics_B_0_deflating=" + std::to_string(dynamics_B_0_deflating)
+            + ", dynamics_B_1_deflating=" + std::to_string(dynamics_B_1_deflating)
+            + "}"
+        ;
     }
 };
 }   // namespace pma_hardware

@@ -20,8 +20,9 @@
 #include "hardware_interface/types/hardware_interface_type_values.hpp"
 #include "joint_trajectory_controller/interpolation_methods.hpp"
 #include "joint_trajectory_controller/tolerances.hpp"
-#include "pma_control/trajectory_util/pma_trajectory_types.hpp"
+#include "pma_hardware/math_utils/compute_pma_robot_model_properties.hpp"
 #include "pma_hardware/types/hardware_interface_type_values.hpp"
+#include "pma_util/pma_trajectory_types.hpp"
 #include "rclcpp_action/server.hpp"
 #include "realtime_tools/realtime_buffer.h"
 #include "realtime_tools/realtime_publisher.h"
@@ -62,6 +63,8 @@ protected:
     using JointTrajectoryMsg = trajectory_msgs::msg::JointTrajectory;
     using JointTrajectoryMsgSharedPtr = std::shared_ptr<JointTrajectoryMsg>;
 
+    using PmaTrajPt = pma_util::PneumaticMuscleActuatorTrajectoryPoint;
+
 public:
     SlidingMode2DofPressureTrajectoryController();
 
@@ -101,10 +104,6 @@ protected:
      */
     const std::vector<std::string> state_interface_types_ =
     {
-        hardware_interface::HW_IF_POSITION,
-        hardware_interface::HW_IF_VELOCITY,
-        hardware_interface::HW_IF_ACCELERATION,
-        hardware_interface::HW_IF_EFFORT,
         pma_hardware::HW_IF_PRESSURE,
     };
 
@@ -152,42 +151,6 @@ protected:
     joint_trajectory_controller::interpolation_methods::InterpolationMethod interpolation_method_;
 
     /**
-     * The scalar magnitude of acceleration due to gravity, in m/s^2. Defaults
-     * to 9.81.
-     */
-    double acceleration_gravity_;
-
-    /**
-     * The k1 design constant for sliding-mode control. Defaults to 1.0.
-     */
-    double sliding_mode_control_k_1_;
-
-    /**
-     * The k2 design constant for sliding-mode control. Defaults to 1.0.
-     */
-    double sliding_mode_control_k_2_;
-
-    /**
-     * The Gamma1 design constant for sliding-mode control. Defaults to 1.0.
-     */
-    double sliding_mode_control_Gamma_1_;
-
-    /**
-     * The Gamma2 design constant for sliding-mode control. Defaults to 1.0.
-     */
-    double sliding_mode_control_Gamma_2_;
-
-    /**
-     * The mu1 design constant for sliding-mode control. Defaults to 1.0.
-     */
-    double sliding_mode_control_mu_1_;
-
-    /**
-     * The mu2 design constant for sliding-mode control. Defaults to 1.0.
-     */
-    double sliding_mode_control_mu_2_;
-
-    /**
      * These command interfaces are defined as the types in
      * @a command_interface_types_. For each type, the interfaces are ordered
      * so that i-th position matches i-th index in joint_names_.
@@ -200,16 +163,24 @@ protected:
      */
     InterfaceReferences<hardware_interface::LoanedStateInterface> joint_state_interface_;
 
-    // Preallocate variables used in the realtime update() function
-    PneumaticMuscleActuatorTrajectoryPoint state_current_;
-    PneumaticMuscleActuatorTrajectoryPoint state_desired_;
-    PneumaticMuscleActuatorTrajectoryPoint state_error_;
+    // Preallocate variables used in the realtime update() function. These are
+    // used to maintain the joint trajectory action.
+    JointTrajectoryMsg joint_space_state_current_;
+    JointTrajectoryMsg joint_space_state_desired_;
+    JointTrajectoryMsg joint_space_state_error_;
 
     /**
-     * The last commanded shoulder and elbow pressures (the first and second
-     * elements of the list, respectively).
+     * The data relevant to the last successfully written commanded pressure.
+     * On cycle i.e. N+M, where M >= 1 with some arbitrary N, this would be the
+     * joint positions, velocities, accelerations, efforts, and pressures
+     * commanded on cycle N.
      */
-    PressureList last_commanded_pressures_;
+    PmaTrajPt last_commanded_;
+    /**
+     * The timestamp that the pressures from @a last_commanded_ were commanded
+     * and its joint position/motion values are associated with.
+     */
+    rclcpp::Time last_update_time_;
 
     // TODO(karsten1987): eventually activate and deactivate subscriber directly when its supported
     bool subscriber_is_active_ = false;
@@ -218,6 +189,7 @@ protected:
     realtime_tools::RealtimeBuffer<JointTrajectoryMsgSharedPtr> traj_msg_external_point_ptr_;
     std::shared_ptr<joint_trajectory_controller::Trajectory>* traj_point_active_ptr_ = nullptr;
     std::shared_ptr<joint_trajectory_controller::Trajectory> traj_external_point_ptr_ = nullptr;
+
     /**
      * A simple 'home' pose, (re)set during on_activate().
      */
@@ -277,8 +249,6 @@ protected:
 
     void preempt_active_goal();
     void set_hold_position();
-
-    void read_state_from_hardware(PneumaticMuscleActuatorTrajectoryPoint& state);
 
     bool reset();
 };

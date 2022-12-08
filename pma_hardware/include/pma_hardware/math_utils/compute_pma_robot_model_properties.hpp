@@ -1,5 +1,10 @@
 #pragma once
 
+#include <cmath>
+#include <Eigen/Core>
+#include <Eigen/LU>
+
+#include "pma_util/pma_trajectory_types.hpp"
 #include "pma_hardware/description/pneumatic_muscle_segment_configuration.hpp"
 #include "pma_hardware/description/pneumatic_muscle_segment_telemetry.hpp"
 
@@ -180,5 +185,94 @@ void compute_elbow_segment_torque_components(
         elbow_torque_nominal_pressure,
         elbow_torque_factor_input_pressure
     );
+}
+
+void compute_core_pma_robot_model_values(
+    const std::vector<pma_hardware::PneumaticMuscleSegmentConfiguration>& pm_segment_configurations,
+    const std::vector<pma_hardware::PneumaticMuscleSegmentTelemetry>& pm_segment_telemetries,
+    const std::vector<double>& joint_positions,
+    const std::vector<double>& joint_velocities,
+    const double acceleration_gravity,
+    Eigen::Vector2d& a,
+    Eigen::Matrix2d& G
+)
+{
+    //
+    // Declare variables for each segment
+    //
+
+    const pma_hardware::PneumaticMuscleSegmentConfiguration& shoulder_segment_configuration = pm_segment_configurations[0];
+    const pma_hardware::PneumaticMuscleSegmentConfiguration& elbow_segment_configuration = pm_segment_configurations[1];
+    const pma_hardware::PneumaticMuscleSegmentTelemetry& shoulder_segment_telemetry = pm_segment_telemetries[0];
+    const pma_hardware::PneumaticMuscleSegmentTelemetry& elbow_segment_telemetry = pm_segment_telemetries[1];
+
+#define DECLARE_SEGMENT_VARS(config, num) \
+    const double m_##num = config.mass; \
+    const double l_##num = config.segment_length; \
+    const double l_com_##num = config.segment_com_length; \
+    const double I_##num = m_##num * l_com_##num * l_com_##num; \
+    const double th_##num = joint_positions[num-1]; \
+    const double th_dot_##num = joint_velocities[num-1]
+
+    DECLARE_SEGMENT_VARS(shoulder_segment_configuration, 1);
+    DECLARE_SEGMENT_VARS(elbow_segment_configuration, 2);
+
+#undef DECLARE_SEGMENT_VARS
+
+    //
+    // Calculate the G matrix
+    //
+
+    // Calculate the torque that is generated on each joint given the system
+    // configuration and the current state of each segment
+    double shoulder_torque_nominal_pressure;
+    double shoulder_torque_factor_input_pressure;
+    double elbow_torque_nominal_pressure;
+    double elbow_torque_factor_input_pressure;
+
+    compute_shoulder_segment_torque_components(
+        shoulder_segment_configuration,
+        shoulder_segment_telemetry,
+        shoulder_torque_nominal_pressure,
+        shoulder_torque_factor_input_pressure
+    );
+    compute_elbow_segment_torque_components(
+        elbow_segment_configuration,
+        elbow_segment_telemetry,
+        elbow_torque_nominal_pressure,
+        elbow_torque_factor_input_pressure
+    );
+
+    // Calculate the inverse of the D matrix
+    const double c_2 = std::cos(th_2);
+    const double d11 = (2 * I_1) + (2 * I_2) + (m_2 * ((l_1 * l_1) + (2 * l_1 * l_com_2 * c_2)));
+    const double d12 = I_2 + (m_2 * l_1 * l_com_2 * c_2);
+    const double d22 = 2 * I_2;
+    const Eigen::Matrix2d D_inv = Eigen::Matrix2d({
+        {d11, d12},
+        {d12, d22}
+    }).inverse();
+
+    // Calculate the G matrix
+    G = D_inv * Eigen::Matrix2d {{
+        {shoulder_torque_factor_input_pressure, 0.0},
+        {0.0,                                   elbow_torque_factor_input_pressure}
+    }};
+
+    //
+    // Calculate the a vector
+    //
+
+    const Eigen::Vector2d th_dot {{th_dot_1, th_dot_2}};
+    const double h = -m_2 * l_1 * l_com_2 * std::sin(th_2);
+    const Eigen::Matrix2d C {
+        {h * th_dot_2,  (h * th_dot_1) + (h * th_dot_2)},
+        {-h * th_dot_1, 0.0}
+    };
+    const double f_2 = m_2 * l_com_2 * acceleration_gravity * std::cos(th_1 + th_2);
+    const double f_1 = (((m_1 * l_com_1) + (m_2 * l_1)) * acceleration_gravity * std::cos(th_1)) + f_2;
+    const Eigen::Vector2d f {{f_1, f_2}};
+    const Eigen::Vector2d tau_0 {{shoulder_torque_nominal_pressure, elbow_torque_nominal_pressure}};
+    a = D_inv * ((C * th_dot * -1) - f + tau_0);
 }
 }   // namespace pma_hardware

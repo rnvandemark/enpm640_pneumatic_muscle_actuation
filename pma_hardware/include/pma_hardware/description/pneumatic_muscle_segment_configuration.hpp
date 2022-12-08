@@ -1,5 +1,7 @@
 #pragma once
 
+#include <string>
+
 #include "pma_hardware/description/individual_pneumatic_muscle_configuration.hpp"
 
 namespace pma_hardware
@@ -106,6 +108,24 @@ public:
             tdB1d
         )
     {
+    }
+
+    /**
+     * Convert this data to a string.
+     * @return The stringified configuration.
+     */
+    std::string to_string() const
+    {
+        return std::string("{")
+            + "mass=" + std::to_string(mass)
+            + ", pulley_radius=" + std::to_string(pulley_radius)
+            + ", segment_length=" + std::to_string(segment_length)
+            + ", segment_com_length=" + std::to_string(segment_com_length)
+            + ", pm_antagonist_pair_count=" + std::to_string(pm_antagonist_pair_count)
+            + ", bicep_configuration=" + bicep_configuration.to_string()
+            + ", tricep_configuration=" + tricep_configuration.to_string()
+            + "}"
+        ;
     }
 };
 }   // namespace pma_hardware

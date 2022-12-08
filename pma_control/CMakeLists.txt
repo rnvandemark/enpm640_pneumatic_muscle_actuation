@@ -7,8 +7,6 @@ find_package(builtin_interfaces REQUIRED)
 find_package(control_msgs REQUIRED)
 find_package(control_toolbox REQUIRED)
 find_package(controller_interface REQUIRED)
-find_package(eigen3_cmake_module REQUIRED)
-find_package(Eigen3 REQUIRED)
 find_package(hardware_interface REQUIRED)
 find_package(joint_trajectory_controller REQUIRED)
 find_package(lifecycle_msgs REQUIRED)
@@ -23,7 +21,6 @@ find_package(trajectory_msgs REQUIRED)
 
 include_directories(
     include
-    ${Eigen3_INCLUDE_DIRS}
     ${pma_hardware_INCLUDE_DIRS}
 )
 
@@ -79,8 +76,6 @@ ament_export_dependencies(
     control_msgs
     control_toolbox
     controller_interface
-    eigen3_cmake_module
-    Eigen3
     hardware_interface
     joint_trajectory_controller
     lifecycle_msgs

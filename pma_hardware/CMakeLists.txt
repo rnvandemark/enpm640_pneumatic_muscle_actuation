@@ -1,13 +1,18 @@
 cmake_minimum_required(VERSION 3.5)
 project(pma_hardware)
 find_package(ament_cmake REQUIRED)
+find_package(eigen3_cmake_module REQUIRED)
+find_package(Eigen3 REQUIRED)
 find_package(pluginlib REQUIRED)
 find_package(controller_interface REQUIRED)
 find_package(hardware_interface REQUIRED)
 find_package(pma_util REQUIRED)
 find_package(rclcpp REQUIRED)
 
-include_directories(include)
+include_directories(
+    include
+    ${Eigen3_INCLUDE_DIRS}
+)
 
 add_library(pma_robot_interfaces SHARED
     src/interface/pma_planar_2dof_interface.cpp
@@ -45,6 +50,8 @@ ament_export_libraries(pma_robot_interfaces)
 ament_export_targets(export_pma_robot_interfaces HAS_LIBRARY_TARGET)
 ament_export_dependencies(
     ament_cmake
+    eigen3_cmake_module
+    Eigen3
     pluginlib
     controller_interface
     hardware_interface

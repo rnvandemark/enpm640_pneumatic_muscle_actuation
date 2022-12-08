@@ -18,11 +18,11 @@
 #include <limits>
 
 #include "controller_interface/helpers.hpp"
+#include "pma_hardware/math_utils/compute_pma_robot_model_properties.hpp"
+#include "pma_util/util.hpp"
 #include "rclcpp/rclcpp.hpp"
 
-#include "pma_util/util.hpp"
-
-#define PMAI_LOG(level, ...) RCLCPP_##level(rclcpp::get_logger("PmaPlanar2DofInterfaceHardware"), __VA_ARGS__)
+#define PMAI_LOG(level, ...) RCLCPP_##level(rclcpp::get_logger("PmaRobotHardware"), __VA_ARGS__)
 
 namespace {
     std::vector<std::string> get_interface_info_list_names(const std::vector<hardware_interface::InterfaceInfo>& list)
@@ -42,35 +42,31 @@ namespace {
 
 namespace pma_hardware
 {
-std::vector<hardware_interface::CommandInterface> PmaPlanar2DofInterfaceHardware::export_command_interfaces()
+std::vector<hardware_interface::CommandInterface> PmaRobotHardware::export_command_interfaces()
 {
     std::vector<hardware_interface::CommandInterface> command_interfaces;
     for (size_t i = 0; i < info_.joints.size(); i++)
     {
-        command_interfaces.emplace_back(info_.joints[i].name, pma_hardware::HW_IF_PRESSURE, &hw_commands_pressures_[i]);
+        command_interfaces.emplace_back(info_.joints[i].name, pma_hardware::HW_IF_PRESSURE, &hw_commands_[i]);
     }
     return command_interfaces;
 }
 
-std::vector<hardware_interface::StateInterface> PmaPlanar2DofInterfaceHardware::export_state_interfaces()
+std::vector<hardware_interface::StateInterface> PmaRobotHardware::export_state_interfaces()
 {
     std::vector<hardware_interface::StateInterface> state_interfaces;
     for (size_t i = 0; i < info_.joints.size(); i++)
     {
-        state_interfaces.emplace_back(info_.joints[i].name, hardware_interface::HW_IF_POSITION, &hw_states_positions_[i]);
-        state_interfaces.emplace_back(info_.joints[i].name, hardware_interface::HW_IF_VELOCITY, &hw_states_velocities_[i]);
-        state_interfaces.emplace_back(info_.joints[i].name, hardware_interface::HW_IF_ACCELERATION, &hw_states_accelerations_[i]);
-        state_interfaces.emplace_back(info_.joints[i].name, hardware_interface::HW_IF_EFFORT, &hw_states_efforts_[i]);
-        state_interfaces.emplace_back(info_.joints[i].name, pma_hardware::HW_IF_PRESSURE, &hw_states_pressures_[i]);
+        state_interfaces.emplace_back(info_.joints[i].name, pma_hardware::HW_IF_PRESSURE, &hw_states_[i]);
     }
     return state_interfaces;
 }
 
-hardware_interface::CallbackReturn PmaPlanar2DofInterfaceHardware::on_init(const hardware_interface::HardwareInfo& info)
+hardware_interface::CallbackReturn PmaRobotHardware::on_init(const hardware_interface::HardwareInfo& info)
 {
     PMAI_LOG(INFO, "Entered on_init()");
 
-    const size_t num_joints = info_.joints.size();
+    const size_t dof = info_.joints.size();
 
     hardware_interface::CallbackReturn rc = hardware_interface::SystemInterface::on_init(info);
     if (hardware_interface::CallbackReturn::SUCCESS != rc)
@@ -84,12 +80,9 @@ hardware_interface::CallbackReturn PmaPlanar2DofInterfaceHardware::on_init(const
     hw_stop_sec_ = stod(info_.hardware_parameters["example_param_hw_stop_duration_sec"]);
     hw_slowdown_ = stod(info_.hardware_parameters["example_param_hw_slowdown"]);
     // END: This part here is for exemplary purposes - Please do not copy to your production code
-    
-    hw_commands_pressures_.resize(num_joints, std::numeric_limits<double>::quiet_NaN());
-    hw_states_positions_.resize(num_joints, std::numeric_limits<double>::quiet_NaN());
-    hw_states_velocities_.resize(num_joints, std::numeric_limits<double>::quiet_NaN());
-    hw_states_accelerations_.resize(num_joints, std::numeric_limits<double>::quiet_NaN());
-    hw_states_pressures_.resize(num_joints, std::numeric_limits<double>::quiet_NaN());
+
+    hw_commands_.resize(dof, std::numeric_limits<double>::quiet_NaN());
+    hw_states_.resize(dof, std::numeric_limits<double>::quiet_NaN());
 
     for (auto iter = info_.joints.cbegin(); iter != info_.joints.cend(); ++iter)
     {
@@ -172,7 +165,7 @@ END:
     return rc;
 }
 
-hardware_interface::CallbackReturn PmaPlanar2DofInterfaceHardware::on_activate(const rclcpp_lifecycle::State& /*previous_state*/)
+hardware_interface::CallbackReturn PmaRobotHardware::on_activate(const rclcpp_lifecycle::State& /*previous_state*/)
 {
     PMAI_LOG(INFO, "Entered on_activate()");
 
@@ -181,29 +174,13 @@ hardware_interface::CallbackReturn PmaPlanar2DofInterfaceHardware::on_activate(c
     // Set some default values
     for (size_t i = 0; i < info_.joints.size(); i++)
     {
-        if (std::isnan(hw_commands_pressures_[i]))
+        if (std::isnan(hw_commands_[i]))
         {
-            hw_commands_pressures_[i] = 0;
+            hw_commands_[i] = 0;
         }
-        if (std::isnan(hw_states_positions_[i]))
+        if (std::isnan(hw_states_[i]))
         {
-            hw_states_positions_[i] = 0;
-        }
-        if (std::isnan(hw_states_velocities_[i]))
-        {
-            hw_states_velocities_[i] = 0;
-        }
-        if (std::isnan(hw_states_accelerations_[i]))
-        {
-            hw_states_accelerations_[i] = 0;
-        }
-        if (std::isnan(hw_states_efforts_[i]))
-        {
-            hw_states_efforts_[i] = 0;
-        }
-        if (std::isnan(hw_states_pressures_[i]))
-        {
-            hw_states_pressures_[i] = 0;
+            hw_states_[i] = 0;
         }
     }
 
@@ -212,7 +189,7 @@ END:
     return rc;
 }
 
-hardware_interface::CallbackReturn PmaPlanar2DofInterfaceHardware::on_deactivate(const rclcpp_lifecycle::State& /*previous_state*/)
+hardware_interface::CallbackReturn PmaRobotHardware::on_deactivate(const rclcpp_lifecycle::State& /*previous_state*/)
 {
     PMAI_LOG(INFO, "Entered on_deactivate()");
 
@@ -223,33 +200,23 @@ END:
     return rc;
 }
 
-hardware_interface::return_type PmaPlanar2DofInterfaceHardware::read(const rclcpp::Time& /*time*/,
-                                                                     const rclcpp::Duration& period)
+hardware_interface::return_type PmaRobotHardware::read(const rclcpp::Time& /*time*/,
+                                                       const rclcpp::Duration& /*period*/)
 {
-//    for (size_t i = 0; i < hw_states_positions_.size(); i++)
-//    {
-//        hw_states_accelerations_[i] = hw_commands_accelerations_[i];
-//        hw_states_velocities_[i] += (hw_states_accelerations_[i] * period.seconds()) / hw_slowdown_;
-//        hw_states_positions_[i] += (hw_states_velocities_[i] * period.seconds()) / hw_slowdown_;
-//        // TODO: log?
-//    }
-    return hardware_interface::return_type::OK;
-}
-
-hardware_interface::return_type PmaPlanar2DofInterfaceHardware::write(const rclcpp::Time& /*time*/,
-                                                                      const rclcpp::Duration& /*period*/)
-{
-    // TODO
+    for (size_t i = 0; i < info_.joints.size(); i++)
+    {
+        hw_states_[i] += ((hw_commands_[i] - hw_states_[i]) / hw_slowdown_);
+    }
 
     return hardware_interface::return_type::OK;
 }
 
-hardware_interface::return_type PmaPlanar2DofInterfaceHardware::prepare_command_mode_switch(
-    const std::vector<std::string>& /*start_interfaces*/,
-    const std::vector<std::string>& /*stop_interfaces*/)
+hardware_interface::return_type PmaRobotHardware::write(const rclcpp::Time& /*time*/,
+                                                        const rclcpp::Duration& /*period*/)
 {
-    // Not supported!
-    return hardware_interface::return_type::ERROR;
+    // Nothing to do for simple, simulated interface...
+
+    return hardware_interface::return_type::OK;
 }
 }
 
@@ -257,4 +224,4 @@ hardware_interface::return_type PmaPlanar2DofInterfaceHardware::prepare_command_
 
 #include "pluginlib/class_list_macros.hpp"
 
-PLUGINLIB_EXPORT_CLASS(pma_hardware::PmaPlanar2DofInterfaceHardware, hardware_interface::SystemInterface)
+PLUGINLIB_EXPORT_CLASS(pma_hardware::PmaRobotHardware, hardware_interface::SystemInterface)

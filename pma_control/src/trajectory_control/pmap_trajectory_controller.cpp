@@ -12,22 +12,78 @@
 #include "pma_hardware/description/pneumatic_muscle_control_configuration.hpp"
 #include "pma_hardware/description/pneumatic_muscle_segment_configuration.hpp"
 #include "pma_hardware/description/pneumatic_muscle_segment_telemetry.hpp"
-#include "pma_hardware/math_utils/compute_segment_torques.hpp"
 #include "pma_util/util.hpp"
 #include "rclcpp_action/create_server.hpp"
 
-#define PMA_PI (M_PI)
-#define PMA_HPI (PMA_PI/2.0)
-
 static const size_t REQUIRED_DOF = 2;
+
+static const double PMA_PI = M_PI;
+static const double PMA_HPI = PMA_PI / 2.0;
+
+const static pma_hardware::PneumaticMuscleControlConfiguration DEFAULT_PMA_CONTROL_CONFIGURATION(
+    /*a_g = */ 9.81,
+    /*k_1 = */ 1.0,
+    /*k_2 = */ 1.0,
+    /*Gamma_1 = */ 1.0,
+    /*Gamma_2 = */ 1.0,
+    /*mu_1 = */ 1.0,
+    /*mu_2 = */ 1.0
+);
+
+const static pma_hardware::PneumaticMuscleSegmentConfiguration DEFAULT_SHOULDER_SEGMENT_CONFIGURATION(
+    /*mass = */ 1.0,
+    /*pulley_radius = */ 0.075,
+    /*segment_length = */ 0.5,
+    /*segment_com_length = */ 0.25,
+    /*pm_antagonist_pair_count = */ 2,
+    /*bicep__nominal_pressure = */ 350.0,
+    /*bicep__dynamics_f_0 = */ 1.0,
+    /*bicep__dynamics_f_1 = */ 1.0,
+    /*bicep__dynamics_k_0 = */ 1.0,
+    /*bicep__dynamics_k_1 = */ 1.0,
+    /*bicep__dynamics_b_0_inflating = */ 1.0,
+    /*bicep__dynamics_b_1_inflating = */ 1.0,
+    /*bicep__dynamics_b_0_deflating = */ 1.0,
+    /*bicep__dynamics_b_1_deflating = */ 1.0,
+    /*tricep__nominal_pressure = */ 350.0,
+    /*tricep__dynamics_f_0 = */ 1.0,
+    /*tricep__dynamics_f_1 = */ 1.0,
+    /*tricep__dynamics_k_0 = */ 1.0,
+    /*tricep__dynamics_k_1 = */ 1.0,
+    /*tricep__dynamics_b_0_inflating = */ 1.0,
+    /*tricep__dynamics_b_1_inflating = */ 1.0,
+    /*tricep__dynamics_b_0_deflating = */ 1.0,
+    /*tricep__dynamics_b_1_deflating = */ 1.0
+);
+const static pma_hardware::PneumaticMuscleSegmentConfiguration DEFAULT_ELBOW_SEGMENT_CONFIGURATION(
+    /*mass = */ 1.0,
+    /*pulley_radius = */ 0.075,
+    /*segment_length = */ 0.5,
+    /*segment_com_length = */ 0.25,
+    /*pm_antagonist_pair_count = */ 2,
+    /*bicep__nominal_pressure = */ 350.0,
+    /*bicep__dynamics_f_0 = */ 1.0,
+    /*bicep__dynamics_f_1 = */ 1.0,
+    /*bicep__dynamics_k_0 = */ 1.0,
+    /*bicep__dynamics_k_1 = */ 1.0,
+    /*bicep__dynamics_b_0_inflating = */ 1.0,
+    /*bicep__dynamics_b_1_inflating = */ 1.0,
+    /*bicep__dynamics_b_0_deflating = */ 1.0,
+    /*bicep__dynamics_b_1_deflating = */ 1.0,
+    /*tricep__nominal_pressure = */ 350.0,
+    /*tricep__dynamics_f_0 = */ 1.0,
+    /*tricep__dynamics_f_1 = */ 1.0,
+    /*tricep__dynamics_k_0 = */ 1.0,
+    /*tricep__dynamics_k_1 = */ 1.0,
+    /*tricep__dynamics_b_0_inflating = */ 1.0,
+    /*tricep__dynamics_b_1_inflating = */ 1.0,
+    /*tricep__dynamics_b_0_deflating = */ 1.0,
+    /*tricep__dynamics_b_1_deflating = */ 1.0
+);
 
 using namespace std::chrono_literals;
 
 namespace im = joint_trajectory_controller::interpolation_methods;
-
-// A single 2-DOF pressure point consists of the robot shoulder pressure (the
-// first element in the pair) and the robot elbow pressure (the second one).
-using JointPressureTrajectory2DofPressure = std::pair<double, double>;
 
 namespace
 {
@@ -36,16 +92,15 @@ namespace
         return rclcpp::Duration::from_seconds((rate > 0.0) ? (1.0 / rate) : 0.0);
     }
 
-    void resize_pma_trajectory_point(
-        pma_control::PneumaticMuscleActuatorTrajectoryPoint& point,
+    void resize_joint_trajectory_point(
+        trajectory_msgs::msg::JointTrajectory& point,
         const size_t size
     )
     {
-        point.joint_space.positions.resize(size, 0.0);
-        point.joint_space.velocities.resize(size, 0.0);
-        point.joint_space.accelerations.resize(size, 0.0);
-        point.joint_space.effort.resize(size, 0.0);
-        point.pressures.resize(size, 0.0);
+        point.positions.resize(size, 0.0);
+        point.velocities.resize(size, 0.0);
+        point.accelerations.resize(size, 0.0);
+        point.effort.resize(size, 0.0);
     }
 
     double sat(const double y)
@@ -64,61 +119,201 @@ namespace
         }
     }
 
-    pma_control::PressureList compute_desired_input_pressures_for(
+    void compute_individual_force_contribution(
+        const pma_hardware::IndividualPneumaticMuscleConfiguration& pm_configuration,
+        const pma_hardware::IndividualPneumaticMuscleTelemetry& pm_telemetry,
+        double& force_nominal_pressure,
+        double& force_factor_input_pressure
+    )
+    {
+        const double length = pm_telemetry.length;
+        const double lengthening_rate = pm_telemetry.lengthening_rate;
+        const bool is_inflating = pm_telemetry.is_inflating();
+        const double P0 = pm_configuration.nominal_pressure;
+        const double F0 = pm_configuration.dynamics_F_0;
+        const double F1 = pm_configuration.dynamics_F_1;
+        const double K0 = pm_configuration.dynamics_K_0;
+        const double K1 = pm_configuration.dynamics_K_1;
+        const double B0 = is_inflating ? pm_configuration.dynamics_B_0_inflating : pm_configuration.dynamics_B_0_deflating;
+        const double B1 = is_inflating ? pm_configuration.dynamics_B_1_inflating : pm_configuration.dynamics_B_1_deflating;
+
+        force_nominal_pressure = (F0 + (F1 * P0)) - (length * (K0 + (K1 * P0))) - (lengthening_rate * (B0 + (B1 * P0)));
+        force_factor_input_pressure = F1 - (length * K1) - (lengthening_rate * B1);
+    }
+
+    // Requires ros params:
+    // - From (5.10):
+    //  - k_1
+    //  - k_2
+    //  - Gamma_1
+    //  - Gamma_2
+    //  - From (3.9)
+    //   - From (A2)
+    //    - m_1
+    //    - m_2
+    //    - l_1
+    //    - l_c_1 (notably, does not need l_c_2)
+    //   - From (A4): None
+    //   - From (A5):
+    //    - g
+    //   - From (3.7a): (BEWARE! POSSIBLE TYPO??)
+    //    - n_s
+    //    - r_s
+    //    - F_0_s
+    //    - F_1_s
+    //    - P_0_b_s
+    //    - P_0_t_s
+    //    - K_0_s
+    //    - K_1_s
+    //    - B_0_b_s
+    //    - B_0_t_s
+    //    - B_1_b_s
+    //    - B_1_t_s
+    //   - From (3.7c): same as (3.7a), but replace 's' (shoulder) subscript with 'e' (elbow)
+    //  - From (5.3):
+    //   - mu_1
+    //   - mu_2
+    //  - From (3.10):
+    //   - From (3.7b): None
+    //   - From (3.7d): same as (3.7b), but replace 's' (shoulder) subscript with 'e' (elbow)
+    // Requires inputs:
+    // - From (A2):
+    //  - actual joint positions
+    // - From (A4):
+    //  - actual joint velocities
+    // - From (3.7a):
+    //  - x_t_s
+    //  - x_dot_t_s
+    //  - x_b_s
+    //  - x_dot_b_s
+    // - From (3.7c): same as (3.7a), but replace 's' (shoulder) subscript with 'e' (elbow)
+    // - From (5.3):
+    //  - desired joint positions
+    // - From (5.4):
+    //  - desired joint velocities
+    void compute_generic_segment_torque_components(
+        const pma_hardware::PneumaticMuscleSegmentConfiguration& segment_configuration,
+        const pma_hardware::PneumaticMuscleSegmentTelemetry& segment_telemetry,
+        const bool bicep_is_positive_contribution,
+        double& torque_nominal_pressure,
+        double& torque_factor_input_pressure
+    )
+    {
+        const pma_hardware::IndividualPneumaticMuscleConfiguration* pm_configuration_positive_contribution_ptr = nullptr;
+        const pma_hardware::IndividualPneumaticMuscleTelemetry* pm_telemetry_positive_contribution_ptr = nullptr;
+        const pma_hardware::IndividualPneumaticMuscleConfiguration* pm_configuration_negative_contribution_ptr = nullptr;
+        const pma_hardware::IndividualPneumaticMuscleTelemetry* pm_telemetry_negative_contribution_ptr = nullptr;
+
+        if (bicep_is_positive_contribution)
+        {
+            pm_configuration_positive_contribution_ptr = &(segment_configuration.bicep_configuration);
+            pm_telemetry_positive_contribution_ptr = &(segment_telemetry.bicep_telemetry);
+            pm_configuration_negative_contribution_ptr = &(segment_configuration.tricep_configuration);
+            pm_telemetry_negative_contribution_ptr = &(segment_telemetry.tricep_telemetry);
+        }
+        else
+        {
+            pm_configuration_positive_contribution_ptr = &(segment_configuration.tricep_configuration);
+            pm_telemetry_positive_contribution_ptr = &(segment_telemetry.tricep_telemetry);
+            pm_configuration_negative_contribution_ptr = &(segment_configuration.bicep_configuration);
+            pm_telemetry_negative_contribution_ptr = &(segment_telemetry.bicep_telemetry);
+        }
+
+        double force_nominal_pressure_positive_contribution;
+        double force_factor_input_pressure_positive_contribution;
+        double force_nominal_pressure_negative_contribution;
+        double force_factor_input_pressure_negative_contribution;
+
+        compute_individual_force_contribution(
+            *pm_configuration_positive_contribution_ptr,
+            *pm_telemetry_positive_contribution_ptr,
+            force_nominal_pressure_positive_contribution,
+            force_factor_input_pressure_positive_contribution
+        );
+        compute_individual_force_contribution(
+            *pm_configuration_negative_contribution_ptr,
+            *pm_telemetry_negative_contribution_ptr,
+            force_nominal_pressure_negative_contribution,
+            force_factor_input_pressure_negative_contribution
+        );
+
+        const double effort_factor = segment_configuration.pm_antagonist_pair_count * segment_configuration.pulley_radius;
+        torque_nominal_pressure = effort_factor * (force_nominal_pressure_positive_contribution - force_nominal_pressure_negative_contribution);
+        torque_factor_input_pressure = effort_factor * (force_factor_input_pressure_positive_contribution - force_factor_input_pressure_negative_contribution);
+    }
+
+    void compute_pma_robot_model(
         const pma_hardware::PneumaticMuscleControlConfiguration& pm_control_configuration,
         const std::vector<pma_hardware::PneumaticMuscleSegmentConfiguration>& pm_segment_configurations,
         const std::vector<pma_hardware::PneumaticMuscleSegmentTelemetry>& pm_segment_telemetries,
         const std::vector<double>& desired_joint_positions,
         const std::vector<double>& desired_joint_velocities,
         const std::vector<double>& actual_joint_positions,
-        const std::vector<double>& actual_joint_velocities
+        const std::vector<double>& actual_joint_velocities,
+        pma_util::PressureList& resulting_pressure_state,
+        Eigen::Vector2d& model_a,
+        Eigen::Matrix2d& model_G
     )
     {
+        //
+        // Declare variables
+        //
+
         const pma_hardware::PneumaticMuscleSegmentConfiguration& shoulder_segment_configuration = pm_segment_configurations[0];
         const pma_hardware::PneumaticMuscleSegmentConfiguration& elbow_segment_configuration = pm_segment_configurations[1];
         const pma_hardware::PneumaticMuscleSegmentTelemetry& shoulder_segment_telemetry = pm_segment_telemetries[0];
         const pma_hardware::PneumaticMuscleSegmentTelemetry& elbow_segment_telemetry = pm_segment_telemetries[1];
-        double shoulder_torque_nominal_pressure;
-        double shoulder_torque_factor_input_pressure;
-        double elbow_torque_nominal_pressure;
-        double elbow_torque_factor_input_pressure;
-
-        pma_hardware::compute_shoulder_segment_torque_components(
-            shoulder_segment_configuration,
-            shoulder_segment_telemetry,
-            shoulder_torque_nominal_pressure,
-            shoulder_torque_factor_input_pressure
-        );
-        pma_hardware::compute_elbow_segment_torque_components(
-            elbow_segment_configuration,
-            elbow_segment_telemetry,
-            elbow_torque_nominal_pressure,
-            elbow_torque_factor_input_pressure
-        );
 
 #define DECLARE_SEGMENT_VARS(config, num) \
         const double m_##num = config.mass; \
         const double l_##num = config.segment_length; \
         const double l_com_##num = config.segment_com_length; \
-        const double I_##num = m_##num * l_com_##num * l_com_##num; \
-        const double th_star_##num = actual_joint_positions[num-1]; \
-        const double th_dot_star_##num = actual_joint_velocities[num-1]; \
-        const double th_##num = desired_joint_positions[num-1]; \
-        const double th_dot_##num = desired_joint_velocities[num-1]
+        const double I_##num = m_##num * l_com_##num * l_com_##num
 
-        // Declare variables for each segment
         DECLARE_SEGMENT_VARS(shoulder_segment_configuration, 1);
         DECLARE_SEGMENT_VARS(elbow_segment_configuration, 2);
 
 #undef DECLARE_SEGMENT_VARS
 
-        // Declare any others
-        const double a_g = pm_control_configuration.a_g;
-        const Eigen::Vector2d th {{th_1, th_2}};
-        const Eigen::Vector2d th_dot {{th_dot_1, th_dot_2}};
-        const double c_2 = std::cos(th_2);
+#define DECLARE_JOINT_VARS(num) \
+        const double th_star_##num = actual_joint_positions[num-1]; \
+        const double th_dot_star_##num = actual_joint_velocities[num-1]; \
+        const double th_##num = desired_joint_positions[num-1]; \
+        const double th_dot_##num = desired_joint_velocities[num-1]
+
+        DECLARE_JOINT_VARS(1);
+        DECLARE_JOINT_VARS(2);
+
+#undef DECLARE_JOINT_VARS
+
+        //
+        // Calculate the G matrix
+        //
+
+        // Calculate the torque that is generated on each joint given the system
+        // configuration and the current state of each segment
+        double shoulder_torque_nominal_pressure;
+        double shoulder_torque_factor_input_pressure;
+        double elbow_torque_nominal_pressure;
+        double elbow_torque_factor_input_pressure;
+
+        compute_generic_segment_torque_components(
+            shoulder_segment_configuration,
+            shoulder_segment_telemetry,
+            false,
+            shoulder_torque_nominal_pressure,
+            shoulder_torque_factor_input_pressure
+        );
+        compute_generic_segment_torque_components(
+            elbow_segment_configuration,
+            elbow_segment_telemetry,
+            true,
+            elbow_torque_nominal_pressure,
+            elbow_torque_factor_input_pressure
+        );
 
         // Calculate the inverse of the D matrix
+        const double c_2 = std::cos(th_2);
         const double d11 = (2 * I_1) + (2 * I_2) + (m_2 * ((l_1 * l_1) + (2 * l_1 * l_com_2 * c_2)));
         const double d12 = I_2 + (m_2 * l_1 * l_com_2 * c_2);
         const double d22 = 2 * I_2;
@@ -127,24 +322,27 @@ namespace
             {d12, d22}
         }).inverse();
 
-        // Calculate the inverse of the G matrix
-        const Eigen::Matrix2d G_inv = (D_inv * Eigen::Matrix2d({
+        // Calculate the G matrix
+        model_G = D_inv * Eigen::Matrix2d {{
             {shoulder_torque_factor_input_pressure, 0.0},
             {0.0,                                   elbow_torque_factor_input_pressure}
-        })).inverse();
+        }};
 
+        //
         // Calculate the a vector
+        //
+
+        const Eigen::Vector2d th_dot {{th_dot_1, th_dot_2}};
         const double h = -m_2 * l_1 * l_com_2 * std::sin(th_2);
-        const Eigen::Matrix2d C
-        {
+        const Eigen::Matrix2d C {
             {h * th_dot_2,  (h * th_dot_1) + (h * th_dot_2)},
             {-h * th_dot_1, 0.0}
         };
-        const double f_2 = m_2 * l_com_2 * a_g * std::cos(th_1 + th_2);
-        const double f_1 = (((m_1 * l_com_1) + (m_2 * l_1)) * a_g * std::cos(th_1)) + f_2;
+        const double f_2 = m_2 * l_com_2 * pm_control_configuration.a_g * std::cos(th_1 + th_2);
+        const double f_1 = (((m_1 * l_com_1) + (m_2 * l_1)) * pm_control_configuration.a_g * std::cos(th_1)) + f_2;
         const Eigen::Vector2d f {{f_1, f_2}};
         const Eigen::Vector2d tau_0 {{shoulder_torque_nominal_pressure, elbow_torque_nominal_pressure}};
-        const Eigen::Vector2d a = D_inv * ((C * th_dot * -1) - f + tau_0);
+        model_a = D_inv * ((C * th_dot * -1) - f + tau_0);
 
         // Calculate the sliding manifold sigma
         const Eigen::Vector2d th_r
@@ -162,11 +360,9 @@ namespace
             pm_control_configuration.k_2 * sat(sigma_2 / pm_control_configuration.Gamma_2)
         }};
 
-        // Calculate the ideal input pressures
-        const Eigen::Vector2d delta_p = G_inv * (th_r - a - ks);
-
-        // Finished, return the input pressures as a list
-        return {delta_p(0), delta_p(1)};
+        // Calculate the resulting input pressures
+        const Eigen::Vector2d delta_p = G.inverse() * (th_r - a - ks);
+        resulting_pressure_state = {delta_p(0), delta_p(1)};
     }
 }
 
@@ -180,14 +376,8 @@ SlidingMode2DofPressureTrajectoryController::SlidingMode2DofPressureTrajectoryCo
     state_publisher_period_(duration_from_rate(state_publish_rate_)),
     action_monitor_rate_(50.0),
     action_monitor_period_(duration_from_rate(action_monitor_rate_)),
-    interpolation_method_(im::DEFAULT_INTERPOLATION),
-    acceleration_gravity_(9.81),
-    sliding_mode_control_k_1_(1.0),
-    sliding_mode_control_k_2_(1.0),
-    sliding_mode_control_Gamma_1_(1.0),
-    sliding_mode_control_Gamma_2_(1.0),
-    sliding_mode_control_mu_1_(1.0),
-    sliding_mode_control_mu_2_(1.0)
+    interpolation_method_(im::DEFAULT_INTERPOLATION)
+    pm_control_configuration(nullptr)
 {
 }
 
@@ -241,9 +431,11 @@ SlidingMode2DofPressureTrajectoryController::on_init()
 
 #define AUTO_DEC1(var_name, param_name, param_type) var_name = auto_declare<param_type>(param_name, var_name)
 #define AUTO_DEC2(var_desc, param_type) AUTO_DEC1(var_desc##_, #var_desc, param_type)
+#define AUTO_DEC_CONFIG_PARAM(param_name, param_type, value) const param_type param_name = auto_declare<param_type>(#param_name, value)
 
     // Declare parameters while the lifecycle node is initializing
-    try {
+    try
+    {
         // Base controller parameters
         AUTO_DEC1(joint_names_, "joints", std::vector<std::string>);
         AUTO_DEC2(state_publish_rate, double);
@@ -254,19 +446,132 @@ SlidingMode2DofPressureTrajectoryController::on_init()
         ));
 
         // Parameters specific to sliding-mode control
-        AUTO_DEC2(acceleration_gravity, double);
-        AUTO_DEC2(sliding_mode_control_k_1, double);
-        AUTO_DEC2(sliding_mode_control_k_2, double);
-        AUTO_DEC2(sliding_mode_control_Gamma_1, double);
-        AUTO_DEC2(sliding_mode_control_Gamma_2, double);
-        AUTO_DEC2(sliding_mode_control_mu_1, double);
-        AUTO_DEC2(sliding_mode_control_mu_2, double);
-    } catch (const std::exception& e) {
+        AUTO_DEC_CONFIG_PARAM(acceleration_gravity, double, DEFAULT_PMA_CONTROL_CONFIGURATION.a_g);
+        AUTO_DEC_CONFIG_PARAM(sliding_mode_control_k_1, double, DEFAULT_PMA_CONTROL_CONFIGURATION.k_1);
+        AUTO_DEC_CONFIG_PARAM(sliding_mode_control_k_2, double, DEFAULT_PMA_CONTROL_CONFIGURATION.k_2);
+        AUTO_DEC_CONFIG_PARAM(sliding_mode_control_Gamma_1, double, DEFAULT_PMA_CONTROL_CONFIGURATION.Gamma_1);
+        AUTO_DEC_CONFIG_PARAM(sliding_mode_control_Gamma_2, double, DEFAULT_PMA_CONTROL_CONFIGURATION.Gamma_2);
+        AUTO_DEC_CONFIG_PARAM(sliding_mode_control_mu_1, double, DEFAULT_PMA_CONTROL_CONFIGURATION.mu_1);
+        AUTO_DEC_CONFIG_PARAM(sliding_mode_control_mu_2, double, DEFAULT_PMA_CONTROL_CONFIGURATION.mu_2);
+
+        // Parameters specific to robot properties
+        AUTO_DEC_CONFIG_PARAM(shoulder_mass, double, DEFAULT_SHOULDER_SEGMENT_CONFIGURATION.mass);
+        AUTO_DEC_CONFIG_PARAM(shoulder_pulley_radius, double, DEFAULT_SHOULDER_SEGMENT_CONFIGURATION.pulley_radius);
+        AUTO_DEC_CONFIG_PARAM(shoulder_segment_length, double, DEFAULT_SHOULDER_SEGMENT_CONFIGURATION.segment_length);
+        AUTO_DEC_CONFIG_PARAM(shoulder_segment_com_length, double, DEFAULT_SHOULDER_SEGMENT_CONFIGURATION.segment_com_length);
+        AUTO_DEC_CONFIG_PARAM(shoulder_pm_antagonist_pair_count, int, DEFAULT_SHOULDER_SEGMENT_CONFIGURATION.pm_antagonist_pair_count);
+        AUTO_DEC_CONFIG_PARAM(shoulder_bicep_nominal_pressure, double, DEFAULT_SHOULDER_SEGMENT_CONFIGURATION.bicep_configuration.nominal_pressure);
+        AUTO_DEC_CONFIG_PARAM(shoulder_bicep_dynamics_F_0, double, DEFAULT_SHOULDER_SEGMENT_CONFIGURATION.bicep_configuration.dynamics_F_0);
+        AUTO_DEC_CONFIG_PARAM(shoulder_bicep_dynamics_F_1, double, DEFAULT_SHOULDER_SEGMENT_CONFIGURATION.bicep_configuration.dynamics_F_1);
+        AUTO_DEC_CONFIG_PARAM(shoulder_bicep_dynamics_K_0, double, DEFAULT_SHOULDER_SEGMENT_CONFIGURATION.bicep_configuration.dynamics_K_0);
+        AUTO_DEC_CONFIG_PARAM(shoulder_bicep_dynamics_K_1, double, DEFAULT_SHOULDER_SEGMENT_CONFIGURATION.bicep_configuration.dynamics_K_1);
+        AUTO_DEC_CONFIG_PARAM(shoulder_bicep_dynamics_B_0_inflating, double, DEFAULT_SHOULDER_SEGMENT_CONFIGURATION.bicep_configuration.dynamics_B_0_inflating);
+        AUTO_DEC_CONFIG_PARAM(shoulder_bicep_dynamics_B_1_inflating, double, DEFAULT_SHOULDER_SEGMENT_CONFIGURATION.bicep_configuration.dynamics_B_1_inflating);
+        AUTO_DEC_CONFIG_PARAM(shoulder_bicep_dynamics_B_0_deflating, double, DEFAULT_SHOULDER_SEGMENT_CONFIGURATION.bicep_configuration.dynamics_B_0_deflating);
+        AUTO_DEC_CONFIG_PARAM(shoulder_bicep_dynamics_B_1_deflating, double, DEFAULT_SHOULDER_SEGMENT_CONFIGURATION.bicep_configuration.dynamics_B_1_deflating);
+        AUTO_DEC_CONFIG_PARAM(shoulder_tricep_nominal_pressure, double, DEFAULT_SHOULDER_SEGMENT_CONFIGURATION.tricep_configuration.nominal_pressure);
+        AUTO_DEC_CONFIG_PARAM(shoulder_tricep_dynamics_F_0, double, DEFAULT_SHOULDER_SEGMENT_CONFIGURATION.tricep_configuration.dynamics_F_0);
+        AUTO_DEC_CONFIG_PARAM(shoulder_tricep_dynamics_F_1, double, DEFAULT_SHOULDER_SEGMENT_CONFIGURATION.tricep_configuration.dynamics_F_1);
+        AUTO_DEC_CONFIG_PARAM(shoulder_tricep_dynamics_K_0, double, DEFAULT_SHOULDER_SEGMENT_CONFIGURATION.tricep_configuration.dynamics_K_0);
+        AUTO_DEC_CONFIG_PARAM(shoulder_tricep_dynamics_K_1, double, DEFAULT_SHOULDER_SEGMENT_CONFIGURATION.tricep_configuration.dynamics_K_1);
+        AUTO_DEC_CONFIG_PARAM(shoulder_tricep_dynamics_B_0_inflating, double, DEFAULT_SHOULDER_SEGMENT_CONFIGURATION.tricep_configuration.dynamics_B_0_inflating);
+        AUTO_DEC_CONFIG_PARAM(shoulder_tricep_dynamics_B_1_inflating, double, DEFAULT_SHOULDER_SEGMENT_CONFIGURATION.tricep_configuration.dynamics_B_1_inflating);
+        AUTO_DEC_CONFIG_PARAM(shoulder_tricep_dynamics_B_0_deflating, double, DEFAULT_SHOULDER_SEGMENT_CONFIGURATION.tricep_configuration.dynamics_B_0_deflating);
+        AUTO_DEC_CONFIG_PARAM(shoulder_tricep_dynamics_B_1_deflating, double, DEFAULT_SHOULDER_SEGMENT_CONFIGURATION.tricep_configuration.dynamics_B_1_deflating);
+        AUTO_DEC_CONFIG_PARAM(elbow_mass, double, DEFAULT_ELBOW_SEGMENT_CONFIGURATION.mass);
+        AUTO_DEC_CONFIG_PARAM(elbow_pulley_radius, double, DEFAULT_ELBOW_SEGMENT_CONFIGURATION.pulley_radius);
+        AUTO_DEC_CONFIG_PARAM(elbow_segment_length, double, DEFAULT_ELBOW_SEGMENT_CONFIGURATION.segment_length);
+        AUTO_DEC_CONFIG_PARAM(elbow_segment_com_length, double, DEFAULT_ELBOW_SEGMENT_CONFIGURATION.segment_com_length);
+        AUTO_DEC_CONFIG_PARAM(elbow_pm_antagonist_pair_count, int, DEFAULT_ELBOW_SEGMENT_CONFIGURATION.pm_antagonist_pair_count);
+        AUTO_DEC_CONFIG_PARAM(elbow_bicep_nominal_pressure, double, DEFAULT_ELBOW_SEGMENT_CONFIGURATION.bicep_configuration.nominal_pressure);
+        AUTO_DEC_CONFIG_PARAM(elbow_bicep_dynamics_F_0, double, DEFAULT_ELBOW_SEGMENT_CONFIGURATION.bicep_configuration.dynamics_F_0);
+        AUTO_DEC_CONFIG_PARAM(elbow_bicep_dynamics_F_1, double, DEFAULT_ELBOW_SEGMENT_CONFIGURATION.bicep_configuration.dynamics_F_1);
+        AUTO_DEC_CONFIG_PARAM(elbow_bicep_dynamics_K_0, double, DEFAULT_ELBOW_SEGMENT_CONFIGURATION.bicep_configuration.dynamics_K_0);
+        AUTO_DEC_CONFIG_PARAM(elbow_bicep_dynamics_K_1, double, DEFAULT_ELBOW_SEGMENT_CONFIGURATION.bicep_configuration.dynamics_K_1);
+        AUTO_DEC_CONFIG_PARAM(elbow_bicep_dynamics_B_0_inflating, double, DEFAULT_ELBOW_SEGMENT_CONFIGURATION.bicep_configuration.dynamics_B_0_inflating);
+        AUTO_DEC_CONFIG_PARAM(elbow_bicep_dynamics_B_1_inflating, double, DEFAULT_ELBOW_SEGMENT_CONFIGURATION.bicep_configuration.dynamics_B_1_inflating);
+        AUTO_DEC_CONFIG_PARAM(elbow_bicep_dynamics_B_0_deflating, double, DEFAULT_ELBOW_SEGMENT_CONFIGURATION.bicep_configuration.dynamics_B_0_deflating);
+        AUTO_DEC_CONFIG_PARAM(elbow_bicep_dynamics_B_1_deflating, double, DEFAULT_ELBOW_SEGMENT_CONFIGURATION.bicep_configuration.dynamics_B_1_deflating);
+        AUTO_DEC_CONFIG_PARAM(elbow_tricep_nominal_pressure, double, DEFAULT_ELBOW_SEGMENT_CONFIGURATION.tricep_configuration.nominal_pressure);
+        AUTO_DEC_CONFIG_PARAM(elbow_tricep_dynamics_F_0, double, DEFAULT_ELBOW_SEGMENT_CONFIGURATION.tricep_configuration.dynamics_F_0);
+        AUTO_DEC_CONFIG_PARAM(elbow_tricep_dynamics_F_1, double, DEFAULT_ELBOW_SEGMENT_CONFIGURATION.tricep_configuration.dynamics_F_1);
+        AUTO_DEC_CONFIG_PARAM(elbow_tricep_dynamics_K_0, double, DEFAULT_ELBOW_SEGMENT_CONFIGURATION.tricep_configuration.dynamics_K_0);
+        AUTO_DEC_CONFIG_PARAM(elbow_tricep_dynamics_K_1, double, DEFAULT_ELBOW_SEGMENT_CONFIGURATION.tricep_configuration.dynamics_K_1);
+        AUTO_DEC_CONFIG_PARAM(elbow_tricep_dynamics_B_0_inflating, double, DEFAULT_ELBOW_SEGMENT_CONFIGURATION.tricep_configuration.dynamics_B_0_inflating);
+        AUTO_DEC_CONFIG_PARAM(elbow_tricep_dynamics_B_1_inflating, double, DEFAULT_ELBOW_SEGMENT_CONFIGURATION.tricep_configuration.dynamics_B_1_inflating);
+        AUTO_DEC_CONFIG_PARAM(elbow_tricep_dynamics_B_0_deflating, double, DEFAULT_ELBOW_SEGMENT_CONFIGURATION.tricep_configuration.dynamics_B_0_deflating);
+        AUTO_DEC_CONFIG_PARAM(elbow_tricep_dynamics_B_1_deflating, double, DEFAULT_ELBOW_SEGMENT_CONFIGURATION.tricep_configuration.dynamics_B_1_deflating);
+
+        // Create the configuration data
+        pm_control_configuration.reset(new pma_hardware::PneumaticMuscleControlConfiguration(
+            acceleration_gravity,
+            sliding_mode_control_k_1,
+            sliding_mode_control_k_2,
+            sliding_mode_control_Gamma_1,
+            sliding_mode_control_Gamma_2,
+            sliding_mode_control_mu_1,
+            sliding_mode_control_mu_2
+        ));
+        pm_segment_configurations.clear();
+        pm_segment_configurations.push_back(pma_hardware::PneumaticMuscleSegmentConfiguration(
+            shoulder_mass,
+            shoulder_pulley_radius,
+            shoulder_segment_length,
+            shoulder_segment_com_length,
+            static_cast<size_t>(shoulder_pm_antagonist_pair_count),
+            shoulder_bicep_nominal_pressure,
+            shoulder_bicep_dynamics_F_0,
+            shoulder_bicep_dynamics_F_1,
+            shoulder_bicep_dynamics_K_0,
+            shoulder_bicep_dynamics_K_1,
+            shoulder_bicep_dynamics_B_0_inflating,
+            shoulder_bicep_dynamics_B_1_inflating,
+            shoulder_bicep_dynamics_B_0_deflating,
+            shoulder_bicep_dynamics_B_1_deflating,
+            shoulder_tricep_nominal_pressure,
+            shoulder_tricep_dynamics_F_0,
+            shoulder_tricep_dynamics_F_1,
+            shoulder_tricep_dynamics_K_0,
+            shoulder_tricep_dynamics_K_1,
+            shoulder_tricep_dynamics_B_0_inflating,
+            shoulder_tricep_dynamics_B_1_inflating,
+            shoulder_tricep_dynamics_B_0_deflating,
+            shoulder_tricep_dynamics_B_1_deflating
+        ));
+        pm_segment_configurations.push_back(pma_hardware::PneumaticMuscleSegmentConfiguration(
+            elbow_mass,
+            elbow_pulley_radius,
+            elbow_segment_length,
+            elbow_segment_com_length,
+            static_cast<size_t>(elbow_pm_antagonist_pair_count),
+            elbow_bicep_nominal_pressure,
+            elbow_bicep_dynamics_F_0,
+            elbow_bicep_dynamics_F_1,
+            elbow_bicep_dynamics_K_0,
+            elbow_bicep_dynamics_K_1,
+            elbow_bicep_dynamics_B_0_inflating,
+            elbow_bicep_dynamics_B_1_inflating,
+            elbow_bicep_dynamics_B_0_deflating,
+            elbow_bicep_dynamics_B_1_deflating,
+            elbow_tricep_nominal_pressure,
+            elbow_tricep_dynamics_F_0,
+            elbow_tricep_dynamics_F_1,
+            elbow_tricep_dynamics_K_0,
+            elbow_tricep_dynamics_K_1,
+            elbow_tricep_dynamics_B_0_inflating,
+            elbow_tricep_dynamics_B_1_inflating,
+            elbow_tricep_dynamics_B_0_deflating,
+            elbow_tricep_dynamics_B_1_deflating
+        ));
+    }
+    catch (const std::exception& e)
+    {
         fprintf(stderr, "Exception thrown during init stage with message: %s\n", e.what());
         rc = CallbackReturn::ERROR;
         goto END;
     }
 
+#undef AUTO_DEC_CONFIG_PARAM
 #undef AUTO_DEC2
 #undef AUTO_DEC1
 
@@ -356,6 +661,7 @@ SlidingMode2DofPressureTrajectoryController::on_configure(const rclcpp_lifecycle
     // Initialize storage to avoid memory allocation during activation
     joint_command_interface_.resize(command_interface_types_.size());
     joint_state_interface_.resize(state_interface_types_.size());
+    pm_segment_telemetries.assign(dof_, pma_hardware::PneumaticMuscleSegmentTelemetry());
 
     // Print interface configuration so users can be sure it's correct
     RCLCPP_INFO(
@@ -401,9 +707,9 @@ SlidingMode2DofPressureTrajectoryController::on_configure(const rclcpp_lifecycle
         std::bind(&SlidingMode2DofPressureTrajectoryController::goal_accepted_callback, this, std::placeholders::_1)
     );
 
-    resize_pma_trajectory_point(state_current_, dof_);
-    resize_pma_trajectory_point(state_desired_, dof_);
-    resize_pma_trajectory_point(state_error_, dof_);
+    resize_joint_trajectory_point(joint_space_state_current_, dof_);
+    resize_joint_trajectory_point(joint_space_state_desired_, dof_);
+    resize_joint_trajectory_point(joint_space_state_error_, dof_);
 
 END:
     RCLCPP_INFO(logger, "on_configure() rc=%s", pma_util::callback_return_to_string(rc));
@@ -483,9 +789,18 @@ SlidingMode2DofPressureTrajectoryController::on_activate(const rclcpp_lifecycle:
     traj_point_active_ptr_ = &traj_external_point_ptr_;
     last_state_publish_time_ = get_node()->now();
 
-    // Initialize the current and desired states from the hardware interfaces
-    read_state_from_hardware(state_current_);
-    state_desired_ = state_current_;
+    // Initialize the current and desired states assuming a 'zero' state
+    // TODO(nick): how to reset position?
+    // TODO(nick): how to reset effort?
+    joint_space_state_current_.positions.resize(dof_, 0.0);
+    joint_space_state_current_.velocities.resize(dof_, 0.0);
+    joint_space_state_current_.accelerations.resize(dof_, 0.0);
+    joint_space_state_current_.effort.resize(dof_, 0.0);
+    joint_space_state_desired_ = joint_space_state_current_;
+
+    // TODO(nick): how to reset pressure?
+    last_commanded_.joint_space = joint_space_state_current_;
+    last_update_time_ = get_node()->now();
 
 END:
     RCLCPP_INFO(get_node()->get_logger(), "on_activate() rc=%s", pma_util::callback_return_to_string(rc));
@@ -578,7 +893,10 @@ controller_interface::return_type SlidingMode2DofPressureTrajectoryController::u
         return controller_interface::return_type::OK;
     }
 
+    //
     // Check if a new external message has been received from nonRT threads
+    //
+
     auto current_external_msg = traj_external_point_ptr_->get_trajectory_msg();
     auto new_external_msg = traj_msg_external_point_ptr_.readFromRT();
     if (current_external_msg != *new_external_msg)
@@ -589,9 +907,44 @@ controller_interface::return_type SlidingMode2DofPressureTrajectoryController::u
         traj_external_point_ptr_->update(*new_external_msg);
     }
 
-    // current state update
-    state_current_.joint_space.time_from_start.set__sec(0);
-    read_state_from_hardware(state_current_);
+    //
+    // Update current state in joint-space and PMA telemetry
+    //
+
+    joint_space_state_current_.time_from_start.set__sec(0);  // TODO(nick): what does this do?
+
+    {
+        // Calculate the time elapsed since the last commanded pressure, then
+        // use it to estimate the current joint positions and velocities
+        const double dt = (time - last_update_time_).seconds();
+        for (size_t index = 0; index < dof_; index++)
+        {
+            joint_space_state_current_.positions[index] += (
+                (js_curr.velocities[index] * dt)
+                + ((js_curr.accelerations[index] * 0.5 * dt * dt))
+            );
+            joint_space_state_current_.positions[index] += (
+                (js_curr.velocities[index] * dt)
+                + ((js_curr.accelerations[index] * 0.5 * dt * dt))
+            );
+        }
+
+        double r = pm_segment_configurations[0].pulley_radius;
+        double th = joint_space_state_current_.positions[0];
+        double th_dot = joint_space_state_current_.velocities[0];
+        pm_segment_telemetries[0].tricep_telemetry.length = r * (th + PMA_HPI);
+        pm_segment_telemetries[0].tricep_telemetry.lengthening_rate = r * th_dot;
+        pm_segment_telemetries[0].bicep_telemetry.length = r * (PMA_HPI - th);
+        pm_segment_telemetries[0].bicep_telemetry.lengthening_rate = -pm_segment_telemetries[0].tricep_telemetry.lengthening_rate;
+
+        r = pm_segment_configurations[1].pulley_radius;
+        th = joint_space_state_current_.positions[1];
+        th_dot = joint_space_state_current_.velocities[1];
+        pm_segment_telemetries[1].bicep_telemetry.length = r * th;
+        pm_segment_telemetries[1].bicep_telemetry.lengthening_rate = r * th_dot;
+        pm_segment_telemetries[1].tricep_telemetry.length = r * (PMA_PI - th);
+        pm_segment_telemetries[1].tricep_telemetry.lengthening_rate = -pm_segment_telemetries[1].bicep_telemetry.lengthening_rate;
+    }
 
     // currently carrying out a trajectory
     if (traj_point_active_ptr_ && (*traj_point_active_ptr_)->has_trajectory_msg())
@@ -601,7 +954,7 @@ controller_interface::return_type SlidingMode2DofPressureTrajectoryController::u
         if (!(*traj_point_active_ptr_)->is_sampled_already())
         {
             first_sample = true;
-            (*traj_point_active_ptr_)->set_point_before_trajectory_msg(time, state_current_.joint_space);
+            (*traj_point_active_ptr_)->set_point_before_trajectory_msg(time, joint_space_state_current_);
         }
 
         // find segment for current timestamp
@@ -612,6 +965,21 @@ controller_interface::return_type SlidingMode2DofPressureTrajectoryController::u
             state_desired_.joint_space,
             start_segment_itr,
             end_segment_itr
+        );
+
+        // Transform desired state in joint-space to desired state in
+        // pressure-space
+        compute_pma_robot_model(
+            *(pm_control_configuration.get()),
+            pm_segment_configurations,
+            pm_segment_telemetries,
+            state_desired_.joint_space.positions,
+            state_desired_.joint_space.velocities,
+            state_current_.joint_space.positions,
+            state_current_.joint_space.velocities,
+            desired_pressures_,
+            desired_a_vector_,
+            desired_G_matrix_
         );
 
         if (valid_point)
@@ -674,23 +1042,13 @@ controller_interface::return_type SlidingMode2DofPressureTrajectoryController::u
             // set values for next hardware write() if tolerance is met
             if (!tolerance_violated_while_moving && within_goal_time)
             {
-                // Convert desired state in joint-space to desired state in
-                // pressure-space
-                const PressureList desired_pressures = compute_desired_input_pressures_for(
-                    *(pm_control_configuration.get()),
-                    pm_segment_configurations,
-                    pm_segment_telemetries,
-                    state_desired_.joint_space.positions,
-                    state_desired_.joint_space.velocities,
-                    state_current_.joint_space.positions,
-                    state_current_.joint_space.velocities
-                );
-
-                // Set values for next hardware write()
                 for (size_t index = 0; index < dof_; ++index)
                 {
                     joint_command_interface_[0][index].get().set_value(desired_pressures[index]);
                 }
+                last_commanded_a_vector_ = desired_a_vector_;
+                last_commanded_G_matrix_ = desired_G_matrix_;
+                last_commanded_pressures_ = desired_pressures_;
             }
 
             const auto active_goal = *rt_active_goal_.readFromRT();
@@ -777,19 +1135,6 @@ controller_interface::return_type SlidingMode2DofPressureTrajectoryController::u
     return controller_interface::return_type::OK;
 }
 
-void SlidingMode2DofPressureTrajectoryController::read_state_from_hardware(PneumaticMuscleActuatorTrajectoryPoint& state)
-{
-    // Assign values from the hardware
-    for (size_t index = 0; index < dof_; ++index)
-    {
-        state.joint_space.positions[index]     = joint_state_interface_[1][index].get().get_value();
-        state.joint_space.velocities[index]    = joint_state_interface_[2][index].get().get_value();
-        state.joint_space.accelerations[index] = joint_state_interface_[3][index].get().get_value();
-        state.joint_space.effort[index]        = joint_state_interface_[4][index].get().get_value();
-        state.pressures[index]                 = joint_state_interface_[5][index].get().get_value();
-    }
-}
-
 bool SlidingMode2DofPressureTrajectoryController::reset()
 {
     subscriber_is_active_ = false;
@@ -802,6 +1147,10 @@ bool SlidingMode2DofPressureTrajectoryController::reset()
 
     // iterator has no default value
     // prev_traj_point_ptr_;
+
+    pm_control_configuration = nullptr;
+    pm_segment_configurations.clear();
+    pm_segment_telemetries.clear();
 
     return true;
 }
