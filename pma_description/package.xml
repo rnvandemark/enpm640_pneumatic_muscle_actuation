@@ -5,7 +5,7 @@
   <version>0.0.0</version>
   <description>Pneumatic muscle actuation (PMA) robot resources for MoveIt.</description>
   <maintainer email="rnvandemark@gmail.com">R. Nick Vandemark</maintainer>
-  <license>BSD</license>
+  <license>Apache-2.0</license>
   <author email="rnvandemark@gmail.com">R. Nick Vandemark</author>
 
   <url type="website">http://moveit.ros.org/</url>
