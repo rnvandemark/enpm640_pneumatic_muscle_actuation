@@ -1,0 +1,5 @@
+# Ignore every LaTeX-generated file related to the report (except the actual report)
+docs/report/*
+!docs/report/report.tex
+!docs/report/report.pdf
+!docs/report/images
